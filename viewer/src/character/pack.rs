@@ -304,6 +304,10 @@ fn fwd_z() -> [f32; 3] {
 /// `Mesh::insert_attribute` wants.
 pub struct MeshData {
     pub name: String,
+    /// The source part (body prefab or equipment item) this mesh was built from. Every VARIANT of
+    /// one garment shares it, whatever the meshes are called, which is what makes selecting one cut
+    /// structural rather than a guess at the naming - see `rig::meshes_to_draw`.
+    pub part: String,
     /// `"third"` or `"first"` — see [`MeshManifest::view`].
     pub view: String,
     pub lod: u32,
@@ -375,6 +379,13 @@ pub struct CharacterPack {
     pub default_lod: u32,
     pub forward: Vec3,
     pub forward_derived: bool,
+    /// Which equipment slots this character actually has filled, from the `kit.json` written
+    /// beside the pack by `build_character.py --kit`. Empty for a pack built without a kit.
+    ///
+    /// It is not cosmetic bookkeeping: a garment is cut per combination it is worn UNDER, so the
+    /// right variant of a top cannot be chosen without knowing whether a chest rig and body armour
+    /// are present. See `rig::meshes_to_draw`.
+    pub kit_slots: Vec<String>,
 }
 
 impl CharacterPack {
@@ -630,6 +641,7 @@ pub fn load(dir: impl AsRef<Path>) -> Result<CharacterPack> {
 
         meshes.push(MeshData {
             name: mm.name.clone(),
+            part: mm.part.clone(),
             view: mm.view.clone(),
             lod: mm.lod,
             positions,
@@ -794,7 +806,21 @@ pub fn load(dir: impl AsRef<Path>) -> Result<CharacterPack> {
         .collect();
 
     let fwd = Vec3::from(m.character_forward);
+    // Optional sidecar: absent on every pack built before equipment existed, and on the
+    // characters.json-specced builds, both of which simply have no kit.
+    let kit_slots: Vec<String> = std::fs::read_to_string(dir.join("kit.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("slots").and_then(|s| s.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
     Ok(CharacterPack {
+        kit_slots,
         attachments,
         root: dir.to_path_buf(),
         id: m.id,

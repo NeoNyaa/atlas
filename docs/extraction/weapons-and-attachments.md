@@ -202,7 +202,8 @@ that bot table, so the shipped M4 legitimately carries both an HHS-1 and a fixed
 folding logic in §4.4 only reaches sights that carry an `AutoFoldableSight` component, and the A2
 does not.
 
-Measured over **63 bot types × 4 seeds = 208 rolled trees**: 4 to 22 mods each (mean 11.8), tree
+Measured over **63 bot types × 4 seeds = 252 rolls, 208 of which name a weapon** (11 bot types ship
+no `FirstPrimaryWeapon` table at all): 4 to 22 mods each (mean 11.8), tree
 depth 1 to **6** (mean 3.08), **zero cycles**, and **0 of the 780 reached required slots left
 empty**.
 
@@ -338,7 +339,7 @@ Two details that bite:
 - `SubMesh.firstByte` is a **byte** offset. The index width comes from
   `MeshHandler.m_Use16BitIndices`, never a hardcoded `/2` (`:605-609`).
 
-Measured on the shipped M4: 0 degenerate triangles, normals unit to within 3 × 10⁻⁴, UV range
+Measured on the shipped M4: 0 degenerate triangles, normals unit to within 3.5 × 10⁻⁴, UV range
 (−0.901, −0.000) to (1.998, 1.000) - out-of-unit UVs are real tiling, and the sampler must repeat.
 
 ### 4.4 The five culls, and what each one prevents
@@ -698,7 +699,7 @@ basis, which is expressed in bone space and therefore stays correct for every an
 ## 8. Materials on the consumer side
 
 `materialProps` carries every `m_Floats` and `m_Colors` entry raw, named as the shader names them
-(`build_weapon.py:638-654`). Measured on the M4: 23 material entries, up to 32 floats and 12
+(`build_weapon.py:638-654`). Measured on the M4: 23 material entries, up to 36 floats and 13
 colours each, with `_Color` on all 23, `_EmissionColor` on 22, `_ReflectColor` and `_SpecColor` on
 21, and a long tail of BSG-specific channels (`USEHEAT`, `_HeatColor1/2`, `_HeatTemp`,
 `_BaseTintColor`, `_FresPow`, `_DropsSpec`).
@@ -777,7 +778,7 @@ as it stands.
 | one LOD kept | baking all of them | three shells of every part merged into one mesh; silhouettes look right, triangle count triples, and the low-LOD skin z-fights through the high one |
 | one scope mode kept | baking `_scopeModeInfos` in full | the HHS-1's G33 magnifier is drawn inline AND flipped aside at once - one optic stacked on a copy of itself. Measured: the HHS-1 declares 2 modes, and its template agrees (`ModesCount: [2]`) |
 | backup sight folded when the build carries an optic | drawing every `AutoFoldableSight` state | the MBUS front sight stands up THROUGH the scope tube. Measured: 4 state node sets, 2 folded and 2 unfolded |
-| duplicate states of a moving part dropped | baking them all | the LA-5's selector is drawn in all five positions at once, a smear of overlapping switches. Measured: 5 renderers, 113 verts each, all centred within a millimetre of (−0.02, −0.53, 0.06) |
+| duplicate states of a moving part dropped | baking them all | the LA-5's selector is drawn in all five positions at once, a smear of overlapping switches. Measured: 5 renderers, 113 verts each, their centres spanning 3.65 mm and all rounding to (−0.02, −0.53, 0.06) |
 | `firstByte` divided by the mesh's real index width | hardcoding `/2` | every 32-bit-indexed mesh reads garbled triangles - a shredded, spiky version of the part, still roughly in the right place |
 | `G3` applied once, winding swapped with it | winding not swapped | every triangle faces inward; the weapon renders inside-out or vanishes under back-face culling |
 | UV `v → 1 − v` baked exactly once | skipped, or repeated in the shader | the gun samples its texture upside down. This reads as a subtle wrong-placement, not as an obvious break - it shipped undetected until 2026-07-31. The manifest does not declare the flip, so nothing can detect it |

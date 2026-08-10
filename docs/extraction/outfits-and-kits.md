@@ -261,7 +261,7 @@ against the canonical rig, weights are renormalised to a partition of unity, and
 inverse-bindpose table is emitted - 79 × 64 bytes ≈ 5 KB per mesh, identity everywhere the item does
 not bind. The payoff is that the item shares the character's single joint palette: no per-item bone
 mapping at runtime, and armour that follows the spine when the character leans. Measured bind widths
-across the twelve packs: a chest rig binds **5 to 10** rig bones, an armour vest **6 to 10**, a
+across the twelve packs: a chest rig binds **5 to 10** rig bones, an `item_equipment_armor_*` vest **8 to 10** (kora kulon 8, both 6B23 10), a
 backpack **7 to 9**, against **12** for trousers and **49 to 61** for a torso garment
 (`top_bear_blacklynx` 49, `top_bear_spna` 52, `tshirt_bear_black` 58, `top_bear_polevoi` 61). On this
 path the kit build passes `skip_unskinned=True` (`build_character.py:272-279`),
@@ -405,8 +405,8 @@ be worn under body armour, a backpack's `_CR_` is the version whose straps are c
 Armour is outermost of its pair and needs no variant; trousers and a t-shirt have nothing to cut for.
 
 **They occupy the same space.** Measured centroid separation between the variants of one part:
-`Top_bear_BlackLynx` base/CR/AR - **7.0 mm**; `BP_WarTech` Body/CR/AR/CR_AR - **15.8 mm**;
-`Bear_Head_3` base/custom - **0.1 mm**. Their bounding boxes agree to about two centimetres. These
+`Top_bear_BlackLynx` base/CR/AR - **7.0 mm**; `BP_WarTech` Body/CR/AR/CR_AR - **17.0 mm**;
+`Bear_Head_3` base/custom - **0.1 mm**. The torso garment's variants agree to about two centimetres; the backpacks' straps are recut, so `BP_WarTech` and `BP_6SH118` differ by 47 mm and 45 mm corner to corner. The point rests on the centroids, not the boxes. These
 are alternatives, not layers.
 
 ### 6.2 Why the extractor ships all of them
@@ -494,16 +494,39 @@ selects between them. What the runtime uses `_custom` for is **unverified**; wha
 the `Dress`/`Skin` MonoBehaviour payload or the `PlayerBody` code. In the meantime the SMR-referenced
 `_base` is the defensible default, and `load_attachment` already applies exactly that rule on the
 rigid path - it skips any mesh whose name ends `_custom` (`skin.py:793-796`), because taking both
-draws the item twice. `load_part` does **not**, so every character pack in `out/characters` carries
-both head meshes.
+draws the item twice. `load_part` does **not**, so every pack whose head prefab ships the pair
+carries both: all twelve kit packs, and `assault_0` / `player_0` / `pmcbear_0` / `pmcusec_0`. The
+boss heads (Glukhar, Killa) and the scav civilian head ship no `_custom` variant, and `tagilla`
+carries no head mesh at all.
 
-### 6.6 No consumer selects automatically
+### 6.6 Who selects, and on what signal
 
-`import_eftchar.py:70-72` records the limitation plainly: every mesh at the selected LOD is imported,
-matching `viewer/src/character/rig.rs`, and `mesh_filter` (`import_eftchar.py:1105`, `:1123`) is the
-manual lever. Nothing in the repo reads `kit.json` and picks a variant. The data needed to do it
-correctly is beside the pack; the selection is not written. This is the single largest gap in the
-outfit pipeline as it stands.
+`import_eftchar.py:70-72` still records the importer's own position: it imports every mesh at the
+selected LOD, and `mesh_filter` (`import_eftchar.py:1105`, `:1123`) is the lever a caller pulls. The
+selection itself lives in the consumers, and there are two, which must agree or a pack reads as a
+different character in each:
+
+| consumer | where |
+|---|---|
+| the reference render harness | `renders/kit_sheet.py::make_keep` (untracked - `renders/` is gitignored) |
+| the viewer | `viewer/src/character/rig.rs::meshes_to_draw` |
+
+**Select on `part`, not on the name.** Both started out grouping by the mesh name with the variant
+tag stripped, and both were wrong, because the bare cut is not untagged - it is spelled `_Base_`,
+`_Body_` or `_body_` - and because the names are not even internally consistent. `assault_0` ships
+`Top_Wildman_Russia_Armor_lod0`, `Top_Wildman_Russia_CR_lod0` and `Top_wild_Russia_base_lod0`: three
+cuts of one garment under two different stems, which no token rule groups. The consequence was
+silent and shipped: `pmcbear_0` drew `Top_bear_BlackLynx_CR_lod0` **and**
+`Top_bear_BlackLynx_Base_lod0`, two coats at once, in every render made before this was caught.
+
+Every mesh carries the `part` it came from (§11), and every variant of a garment shares it by
+construction, whatever it is called. Grouping on `part` is therefore structural in the way the rest
+of this pipeline prefers: it cannot drift as items are added.
+
+The guard against over-merging is geometric. A part MAY ship two genuinely separate pieces rather
+than two cuts of one, so a member whose AABB centre is more than 0.25 m from the chosen mesh is kept
+as well - alternatives are co-located by definition, and measured, the variants of one garment sit
+within 17 mm of each other (§6.5).
 
 ---
 
@@ -704,7 +727,7 @@ have not been observed on a render in this repo as it stands.
 | every worn item comes from THIS bot type's own table | an item is written into the spec by hand | a complete, well-formed, plausible character the game never spawns. Nothing errors and no check exists: the `head_civilian_1` scav passed review for months. `--prefer` cannot express this, which is the guardrail |
 | the weights are the game's | a table is edited, or a "sensible" uniform pick replaces the weighted one | the population is wrong in aggregate and right in every instance, so no single render reveals it. Measured reference: `pmcbear` Headwear is 22 options summing to 67, `item_equipment_helmet_LSHZ` 8 and `cap_BEAR` 7 |
 | the kit and the body are seeded together | rolling appearance separately from the kit | the pack contains a body the kit sidecar does not describe, so variant selection picks against the wrong garment. `loadout.py:185` makes this impossible by calling `appearance.resolve` with the same seed |
-| the skinned/rigid split is decided by the prefab's renderer | routing by slot name | 86 of 87 `pmcbear` items still work and `item_equipment_facecover_beard_red` - a rigid beard in a slot that is otherwise cloth - goes down the skinned path, where it has no weights and is silently skipped: the character has no beard and no error |
+| the skinned/rigid split is decided by the prefab's renderer | routing by slot name | 86 of 87 `pmcbear` items still work and `item_equipment_facecover_beard_red` - a rigid beard in a slot that is otherwise cloth - goes down the skinned path, where `skip_unskinned` drops its only mesh and `load_part` then raises `no meshes survived the LOD filter` (`skin.py:634-635`), which `build_character.py:276-283` does not catch. The build DIES rather than shipping a beardless bot - loud, not silent, which is the better failure but not the documented one |
 | a rigid item's bone is AUTHORED and flagged | treated as derived | nothing breaks today, and the next slot that produces a rigid item inherits an untested guess. Measured: only `Base HumanHead` is exercised in twelve `pmcbear` packs; the `Backpack` / `Spine3` / `ArmBand` entries are unverified |
 | an attachment is composed in the frame it was AUTHORED in | using the weapon's rule (undoing `q4`) on rigid equipment | the item is present, watertight and correctly textured, and rotated 90 degrees: a helmet's crown points forward out of the face, a cap sits on the cheek |
 | the socket's remaining two axes come from the bind pose, not a second guess | fixing "up" only | the item is crown-up and yawed: a headset lies across the skull sideways, a ballcap's peak points out over the ear. `_socket_basis` derives it from `up = +Y`, `forward = characterForward`, `right = up × forward` |
@@ -732,8 +755,9 @@ have not been observed on a render in this repo as it stands.
 - **`build_loadouts.py`'s routing: classify, then ignore it.** This is the defect `kit_parts.py`
   exists to route around, and it is worth recording precisely because the module looks correct.
   `build_loadouts.classify()` (`build_loadouts.py:36-54`) reports skinned-versus-rigid accurately - 
-  `kit_parts` still calls it - and then `build_loadouts.py:110-119` stores the answer in `kind`,
-  writes it into `kit.json`, and hands **every** item to `build_weapon.build()` regardless. The rigid
+  `kit_parts` still calls it - and then `build_loadouts.py:110-119` classifies and builds
+  regardless, writing `kind` into the kit record at `build_loadouts.py:126-130`. **Every** item goes
+  to `build_weapon.build()` whatever `classify` said. The rigid
   weapon assembler merges every mesh in the prefab: both LODs, every unworn variant, and the
   dropped-on-the-ground proxy with its own transform.
 
@@ -744,7 +768,7 @@ have not been observed on a render in this repo as it stands.
   | `item_equipment_rig_strandhogg` | 21,194 v, 18 submeshes, bbox **1.813 m** | 10,597 v, 9 submeshes, bbox **0.613 m** |
   | `item_equipment_backpack_wartech` | 9,505 v, bbox **1.782 m** | 4,324 v, bbox **0.565 m** |
   | `item_equipment_armor_kora_kulon_black` | 5,090 v, bbox **1.788 m** | 2,545 v, bbox **0.472 m** |
-  | `item_equipment_rig_tv115` | 11,728 v, bbox **1.835 m** | 5,864 v, bbox **0.463 m** |
+  | `item_equipment_rig_tv115` | 11,728 v, bbox **1.835 m** | 5,864 v, bbox **0.470 m** |
   | `backpack_Raid_6SH118` | 17,551 v, bbox **2.262 m** | 8,268 v, bbox **1.010 m** |
   | `item_equipment_facecover_nomexBalaclava` | 2,562 v, bbox **1.983 m** | - (never built skinned) |
 
@@ -755,8 +779,8 @@ have not been observed on a render in this repo as it stands.
   in the sum too. The bounding box inflates to metres only when one of those proxies sits away from
   the origin, which is why `item_equipment_rig_triton` lands at a correct 0.532 m - identical to its
   worn mesh - while `strandhogg` lands at 1.813 m. `kit_parts.py:14-15` records 1.78 m for the
-  WarTech backpack and 1.95 m for the balaclava; re-measured here they are 1.782 m and 1.953 m on the
-  Y axis, 1.983 m on the longest.
+  WarTech backpack and 1.95 m for the balaclava; re-measured here the WarTech is 1.782 m on its longest
+  axis and the balaclava 1.953 m on Y, 1.983 m on the longest.
 
   **The same baker is correct for rigid items**, which is the reason the bug survived: `cap_BEAR`
   bakes to `0.175 × 0.313 × 0.132`, byte-for-byte the bounding box of the `item_equipment_head_BEAR_LOD0_base`

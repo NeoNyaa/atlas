@@ -26,6 +26,133 @@ use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use std::collections::HashMap;
 
+/// Which meshes to actually draw: ONE cut of each garment, and nothing twice.
+///
+/// The viewer used to draw every mesh at the LOD. That was right while a pack was clothing and a
+/// face, and became wrong the moment equipment arrived, because a kit pack ships ALTERNATIVES:
+///
+/// VARIANTS. A garment is authored per combination it is worn UNDER - `_AR_` with body armour,
+/// `_CR_` with a chest rig, `_CR_AR_` with both, and a bare cut with neither - and they occupy the
+/// same space. Drawing them all is three coats at once; always taking the bare one puts a jacket cut
+/// for a naked torso underneath a rig, which intersects it. Which one is right is a function of the
+/// KIT, which is why `kit.json` records the filled slots and `pack.kit_slots` carries them here.
+///
+/// DUPLICATES. The same geometry ships under two names: the strandhogg rig is listed twice by two
+/// renderers, and a cold-gear face cover arrives as both `item_equipment_Mask_..._custom` and
+/// `mask_...`. Co-located identical geometry z-fights.
+///
+/// GROUP ON `part`, NOT ON THE NAME. The obvious rule - strip the variant tag and group by what is
+/// left - is wrong twice over. The bare cut is not untagged, it is spelled `_Base_` / `_Body_`; and
+/// the names are not internally consistent, so `assault_0`'s `Top_Wildman_Russia_Armor_lod0`,
+/// `Top_Wildman_Russia_CR_lod0` and `Top_wild_Russia_base_lod0` are three cuts of one garment under
+/// two different stems that no token rule groups. Every mesh records the `part` it was built from,
+/// and every variant of a garment shares it by construction, whatever it is called.
+///
+/// The guard against over-merging is geometric: a part MAY ship two genuinely separate pieces rather
+/// than two cuts of one, so a member whose AABB centre is far from the chosen mesh is kept as well.
+/// Measured, the variants of one garment sit within 17 mm of each other, so 0.25 m is a wide margin.
+///
+/// Mirrors `renders/kit_sheet.py::make_keep`; the two renderers must agree or a pack looks like a
+/// different character in Blender than it does here.
+fn meshes_to_draw(pack: &CharacterPack, lod: u32) -> Vec<usize> {
+    const VARIANT: [&str; 4] = ["ar", "cr", "base", "body"];
+    // Token-wise, and never at index 0: a leading `AR_` / `CR_` is the ITEM CLASS (armour, chest
+    // rig), not a variant tag - `AR_Kora_kulon_LOD0` is an armour vest, not an "AR cut".
+    let variant_label = |name: &str| -> String {
+        let low = name.to_ascii_lowercase();
+        let mut has_cr = false;
+        let mut has_ar = false;
+        for (i, t) in low.split('_').enumerate() {
+            if i == 0 || !VARIANT.contains(&t) {
+                continue;
+            }
+            match t {
+                "cr" => has_cr = true,
+                "ar" => has_ar = true,
+                _ => {}
+            }
+        }
+        match (has_cr, has_ar) {
+            (true, true) => "cr_ar".to_string(),
+            (true, false) => "cr".to_string(),
+            (false, true) => "ar".to_string(),
+            (false, false) => String::new(),
+        }
+    };
+    let has = |s: &str| pack.kit_slots.iter().any(|k| k == s);
+    let want: &str = match (has("ArmorVest"), has("TacticalVest")) {
+        (true, true) => "cr_ar",
+        (true, false) => "ar",
+        (false, true) => "cr",
+        (false, false) => "",
+    };
+    // No cut for this exact combination: prefer fewer layers over more.
+    let fallback: &[&str] = match want {
+        "cr_ar" => &["cr_ar", "cr", "ar", ""],
+        "ar" => &["ar", ""],
+        "cr" => &["cr", ""],
+        _ => &["", "cr", "ar", "cr_ar"],
+    };
+
+    let centre = |i: usize| -> Vec3 {
+        let p = &pack.meshes[i].positions;
+        if p.is_empty() {
+            return Vec3::ZERO;
+        }
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for v in p {
+            let v = Vec3::from(*v);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        (lo + hi) * 0.5
+    };
+
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for i in 0..pack.meshes.len() {
+        if pack.meshes[i].lod != lod {
+            continue;
+        }
+        let key: &str = if pack.meshes[i].part.is_empty() {
+            &pack.meshes[i].name
+        } else {
+            &pack.meshes[i].part
+        };
+        groups.entry(key).or_default().push(i);
+    }
+
+    let mut out: Vec<usize> = Vec::new();
+    for (_, mem) in groups.iter() {
+        if mem.len() == 1 {
+            out.push(mem[0]);
+            continue;
+        }
+        // `_custom` carries the character's own face over the `_base` skin; prefer it where both
+        // exist, and fall back to the whole group where neither is a skin pair.
+        let cust: Vec<usize> = mem
+            .iter()
+            .copied()
+            .filter(|&i| pack.meshes[i].name.to_ascii_lowercase().contains("custom"))
+            .collect();
+        let pool = if cust.is_empty() { mem.clone() } else { cust };
+        let pick = fallback
+            .iter()
+            .find_map(|w| pool.iter().copied().find(|&i| variant_label(&pack.meshes[i].name) == *w))
+            .unwrap_or(pool[0]);
+        out.push(pick);
+        let c = centre(pick);
+        for &i in mem {
+            if i != pick && centre(i).distance(c) > 0.25 {
+                out.push(i);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Rest-pose world rotation per bone, from the skeleton's own local chain.
 ///
 /// `parents[i] < i` is asserted by the loader, so one forward pass is enough.
@@ -275,10 +402,10 @@ pub fn spawn(
     // ---- skinned meshes ----
     let mut spawned_meshes = 0usize;
     let mut mesh_entities: Vec<Entity> = Vec::new();
-    for md in &pack.meshes {
-        if md.lod != lod {
-            continue;
-        }
+    let draw = meshes_to_draw(pack, lod);
+    let dropped = pack.meshes.iter().filter(|m| m.lod == lod).count() - draw.len();
+    for &mi in &draw {
+        let md = &pack.meshes[mi];
         let ibm = ibms.add(SkinnedMeshInverseBindposes::from(md.inverse_bindposes.clone()));
         for sub in &md.submeshes {
             if sub.index_count == 0 {
@@ -380,10 +507,12 @@ pub fn spawn(
     });
 
     info!(
-        "character '{}' spawned: {} bones, {} skinned draws, {} attachment draws, {} clips, forward={:?}{}",
+        "character '{}' spawned: {} bones, {} skinned draws ({} variant/duplicate meshes dropped, kit slots {:?}), {} attachment draws, {} clips, forward={:?}{}",
         pack.display_name,
         bone_count,
         spawned_meshes,
+        dropped,
+        pack.kit_slots,
         spawned_attachments,
         pack.clips.len(),
         pack.forward,
