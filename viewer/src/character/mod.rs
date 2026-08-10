@@ -19,6 +19,7 @@
 
 pub mod anim;
 pub mod drive;
+pub mod hold;
 pub mod pack;
 pub mod rig;
 pub mod weapon;

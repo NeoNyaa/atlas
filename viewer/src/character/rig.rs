@@ -227,6 +227,10 @@ pub struct CharacterRoot {
     /// crossing zero swaps states and the body snapped to the incoming clip's first frame.
     pub prev_state: String,
     pub prev_time: f32,
+    /// The weapon grip being carried across clips that key no `Weapon_root` (see `super::hold`).
+    /// Per CHARACTER, because carrying one man's grip into another man's transition is worse than
+    /// not carrying at all.
+    pub weapon_grip: Option<Mat4>,
     pub fade: f32,
     pub fade_len: f32,
     /// The BODY's facing yaw (radians), independent of the camera. Keeping this separate is what
@@ -498,6 +502,7 @@ pub fn spawn(
         state: String::new(),
         state_time: 0.0,
         prev_state: String::new(),
+        weapon_grip: None,
         prev_time: 0.0,
         fade: 1.0,
         fade_len: 0.0,
