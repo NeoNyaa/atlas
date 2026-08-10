@@ -228,14 +228,38 @@ class _Pack(object):
             w[i] = locals_[i] if p < 0 else w[p] @ locals_[i]
         return w
 
-    def merged_inverse_bindposes(self):
-        """One IBP per bound bone.  All meshes agree to ~7e-7 on shared bones (verified on scav).
+    def merged_inverse_bindposes(self, tol=1e-4):
+        """One IBP per bound bone, plus the per-mesh correction needed to get there.
 
-        Attachments are excluded: they pin every vertex to bone 0 with full weight and carry a
-        separate bone + local TRS, so their tables describe a different binding.
+        Blender has ONE armature with ONE rest pose and skins `Pose(j) @ Rest(j)^-1 @ v`, while the
+        pack skins `Pose(j) @ InverseBindpose_mesh(j) @ v`.  Those agree only where every mesh shares
+        a bindpose table.  Body parts do (they agree to ~7e-7).  EQUIPMENT does not: measured on
+        out/characters/kit_bear_2 the `BP_6SH118` backpack disagrees with the body on all 8 shared
+        bones by 1.245, and the mesh tears into long spikes.
+
+        Two things make a naive merge unable to see the structure:
+
+          * the FIRST-PERSON HANDS bind the same rig with a different binding (1.364 off the body)
+            and are never drawn with it, so they must not define shared bones - third-person
+            geometry is passed first and the hands only fill bones nothing else binds;
+          * a mesh that is the FIRST to claim a bone becomes its own reference there, so a backpack
+            claiming `Base HumanBackpack` alone compares as identity on that bone and as a 90 degree
+            rotation on the spine, and a genuinely constant offset reads as non-constant.
+
+        So the offset is estimated ONLY over bones some OTHER mesh already defined.  When it is a
+        constant right factor `IBP_mesh(j) = IBP_ref(j) @ C`, the mesh can be carried into the
+        reference frame by baking C into its vertices, exactly and for any number of influences,
+        because C factors out of `sum_j w_j Pose(j) IBP(j) v`.  The bones that mesh alone binds are
+        then stored PRE-CORRECTED as `own[b] @ C^-1`, or the bake would displace them by C.
+
+        Returns (table, worst_disagreement, {mesh_name: C}).  Attachments are excluded throughout:
+        they pin every vertex to bone 0 and carry their own bone + local TRS.
         """
-        out, worst = {}, 0.0
-        for md in self.m.get("meshes", []):
+        def _rank(md):
+            return 1 if str(md.get("view", "third")) == "first" else 0
+
+        out, owner, worst, fixes = {}, {}, 0.0, {}
+        for md in sorted(self.m.get("meshes", []), key=_rank):
             rows = md.get("inverseBindposes")
             if not rows:
                 continue
@@ -243,15 +267,45 @@ class _Pack(object):
                 raise ValueError("%s has a %d-row bindpose table, boneCount is %d"
                                  % (md.get("name"), len(rows), self.n_bones))
             tab = np.asarray(rows, dtype=np.float64).reshape(self.n_bones, 4, 4)
+            name = md.get("name")
+            bound = []
             for b in md.get("boundBones", []):
                 b = int(b)
                 if b < 0 or b >= self.n_bones:
-                    raise ValueError("%s binds bone %d, out of range" % (md.get("name"), b))
+                    raise ValueError("%s binds bone %d, out of range" % (name, b))
+                bound.append(b)
+
+            shared = [b for b in bound if b in out and owner.get(b) != name]
+            c = None
+            if shared:
+                cs = []
+                for b in shared:
+                    try:
+                        cs.append(np.linalg.inv(out[b]) @ tab[b])
+                    except np.linalg.LinAlgError:
+                        cs = []
+                        break
+                if cs:
+                    cs = np.asarray(cs)
+                    cm = cs.mean(axis=0)
+                    spread = float(np.abs(cs - cm).max())
+                    if float(np.abs(cm - np.eye(4)).max()) < 1e-6:
+                        pass                                  # already in the reference frame
+                    elif spread <= tol:
+                        c = cm                                # constant: bakeable
+                    else:
+                        if _rank(md) == 0:
+                            worst = max(worst, spread)
+            if c is not None:
+                fixes[name] = c
+                c_inv = np.linalg.inv(c)
+            for b in bound:
                 if b in out:
-                    worst = max(worst, float(np.abs(out[b] - tab[b]).max()))
-                else:
-                    out[b] = tab[b]
-        return out, worst
+                    continue
+                out[b] = (tab[b] @ c_inv) if c is not None else tab[b]
+                owner[b] = name
+        return out, worst, fixes
+
 
 
 def _renderer_matrix(rest_worlds, ibps):
@@ -714,8 +768,13 @@ def _socket_basis(arm_obj, bone_name, forward_pack):
     return np.linalg.inv(rest_rot) @ desired
 
 
-def _build_mesh(pack, md, t_r, mats, bone_names, arm_obj, collection, prefix):
+def _build_mesh(pack, md, t_r, mats, bone_names, arm_obj, collection, prefix, fix=None):
     pos, nrm, uv, ji, jw = _slice_vertices(pack, md)
+    if fix is not None:
+        # Carry this mesh into the frame the SHARED rest pose expects (see _mesh_bindpose_fix).
+        f3 = fix[:3, :3]
+        pos = pos @ f3.T + fix[:3, 3][None, :]
+        nrm = nrm @ np.linalg.inv(f3)
     idx = _slice_indices(pack, md)
     if idx.size and int(idx.max()) >= pos.shape[0]:
         raise ValueError("%s: index %d exceeds vertexCount" % (md["name"], int(idx.max())))
@@ -1006,7 +1065,7 @@ def import_eftchar(char_dir, clip_name=None, loops=1, name_prefix="",
 
     rest_locals = pack.rest_locals()
     rest_worlds = pack.rest_worlds(rest_locals)
-    ibps, ibp_disagree = pack.merged_inverse_bindposes()
+    ibps, ibp_disagree, ibp_fixes = pack.merged_inverse_bindposes()
     t_r, support, n_bound = _renderer_matrix(rest_worlds, ibps)
     bind_worlds = _bind_worlds(pack, rest_locals, rest_worlds, ibps, t_r)
     bind_locals = _bind_locals(pack, bind_worlds)
@@ -1035,6 +1094,7 @@ def import_eftchar(char_dir, clip_name=None, loops=1, name_prefix="",
 
     want_lod = int(pack.m.get("defaultLod", 0)) if lod is None else int(lod)
     mesh_objs, n_v, n_t, n_w, skipped = [], 0, 0, 0, 0
+    n_fixed = 0
     for md in pack.m.get("meshes") or []:
         if int(md.get("lod", 0)) != want_lod:
             skipped += 1
@@ -1045,7 +1105,11 @@ def import_eftchar(char_dir, clip_name=None, loops=1, name_prefix="",
         if mesh_filter is not None and not mesh_filter(md["name"]):
             skipped += 1
             continue
-        obj, v, t, w = _build_mesh(pack, md, t_r, mats, bone_names, arm_obj, coll, name_prefix)
+        fix = ibp_fixes.get(md["name"])
+        if fix is not None:
+            n_fixed += 1
+        obj, v, t, w = _build_mesh(pack, md, t_r, mats, bone_names, arm_obj, coll, name_prefix,
+                                   fix=fix)
         mesh_objs.append(obj)
         n_v += v
         n_t += t
@@ -1094,6 +1158,9 @@ def import_eftchar(char_dir, clip_name=None, loops=1, name_prefix="",
           % (support, n_bound, axis_txt))
     print("[eftchar] geometry   %d mesh(es) at lod %d (%d skipped), %d verts, %d tris, %d weights"
           % (len(mesh_objs), want_lod, skipped, n_v, n_t, n_w))
+    if n_fixed:
+        print("[eftchar] bindpose   %d mesh(es) carried a constant bindpose offset from the pack "
+              "table; baked into their vertices" % n_fixed)
     print("[eftchar] materials  %d, textures %d, UV V un-flipped for Blender: %s"
           % (len(mats), len(pack.m.get("textures") or []), pack.uv_v_flipped))
     n_att = len(pack.m.get("attachments") or [])
