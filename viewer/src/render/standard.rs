@@ -1,8 +1,20 @@
 //! standard.rs — BEVY STANDARD MESH-PATH renderer for a `.eftpack`.
 //!
 //! Renders the pack as ordinary `Mesh3d` + `MeshMaterial3d(StandardMaterial)`
-//! entities, one per (instance × submesh), placing each with the instance's FULL
-//! affine via `Transform::from_matrix`. Unlike the custom `gpu_driven` path (which
+//! entities, one per (instance × submesh), placing each with `Transform::from_matrix`.
+//!
+//! THIS PATH CANNOT PLACE A SHEARED INSTANCE, and it used to claim it could. A Bevy
+//! `Transform` is T·R(quat)·S and has no shear term at all, so `Transform::from_matrix`
+//! on a sheared affine silently returns the nearest unsheared one. About 1.25% of this
+//! game's instances carry legitimate shear - the pipeline's cardinal rule is that the raw
+//! 3×3 is applied to vertices and never decomposed, precisely because of them - and on
+//! this path they render subtly the wrong shape.
+//!
+//! It is now COUNTED AND REPORTED rather than silent. Fixing it properly means either
+//! baking the linear part into a per-instance mesh copy for those instances, or routing
+//! them to `gpu_driven`, which applies the raw 3×3 and is the default path anyway; this
+//! one is opt-in via `EFT_RENDER=std` to get Bevy's lighting stack. Unlike the custom
+//! `gpu_driven` path (which
 //! bypasses Bevy's mesh/material/prepass systems entirely), this path flows through
 //! Bevy's PBR pipeline — so the full built-in lighting stack (cascaded shadow maps,
 //! SSAO, SSR, volumetric fog, and the experimental Solari RTX GI) applies to the
@@ -464,6 +476,7 @@ fn spawn_standard(
 
     // 3. Spawn one entity per (instance × submesh) with the instance's full affine.
     let mut n_entities = 0usize;
+    let mut n_sheared = 0usize;
     for (idx, inst) in pack.instances.iter().enumerate() {
         // All-LOD pack: the standard-path entity spawn uses the default shell only.
         if !pack.is_default_lod(idx) {
@@ -473,7 +486,23 @@ fn spawn_standard(
         if mid >= submesh_assets.len() {
             continue;
         }
-        let xform = Transform::from_matrix(Mat4::from(inst.affine3a()));
+        // SHEAR CHECK. Columns of a rigid-plus-scale linear part are mutually perpendicular; if
+        // they are not, `Transform` cannot hold this instance and the decomposition below drops the
+        // shear. Same 0.02 tolerance the Blender importer uses for the same test.
+        let aff = inst.affine3a();
+        let l = Mat3::from(aff.matrix3);
+        let (c0, c1, c2) = (l.col(0), l.col(1), l.col(2));
+        let (n0, n1, n2) = (c0.length(), c1.length(), c2.length());
+        if n0 > 1e-9 && n1 > 1e-9 && n2 > 1e-9 {
+            let sk = (c0.dot(c1) / (n0 * n1))
+                .abs()
+                .max((c0.dot(c2) / (n0 * n2)).abs())
+                .max((c1.dot(c2) / (n1 * n2)).abs());
+            if sk > 0.02 {
+                n_sheared += 1;
+            }
+        }
+        let xform = Transform::from_matrix(Mat4::from(aff));
         for (mesh_h, mat_h) in &submesh_assets[mid] {
             commands.spawn((
                 Mesh3d(mesh_h.clone()),
@@ -483,6 +512,12 @@ fn spawn_standard(
             ));
             n_entities += 1;
         }
+    }
+    if n_sheared > 0 {
+        warn!(
+            "EFT_RENDER=std: {} of {} placed instances carry shear that a Bevy Transform cannot              represent, so they render as the nearest unsheared shape. The gpu_driven path (the              default) applies the raw 3x3 and is unaffected.",
+            n_sheared, n_entities
+        );
     }
 
     info!(

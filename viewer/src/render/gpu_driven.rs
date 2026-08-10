@@ -1275,7 +1275,7 @@ pub fn build_frustum_planes(clip_from_world: Mat4) -> [Vec4; 6] {
 /// (a negligible loosening of the broad-phase cull). Max-column-norm â€” the original
 /// bug â€” is a LOWER bound and must never be used. No decompose; matches the WGSL
 /// `world_sphere_from_affine` fallback in gpu_cull.wgsl.
-fn conservative_radius_scale(l: Mat3) -> f32 {
+pub fn conservative_radius_scale(l: Mat3) -> f32 {
     let c0 = l.col(0);
     let c1 = l.col(1);
     let c2 = l.col(2);

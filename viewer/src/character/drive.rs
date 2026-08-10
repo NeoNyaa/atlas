@@ -566,7 +566,7 @@ pub fn aim_down_sights(
     aim: Option<Res<PlayerAim>>,
     mut blend: ResMut<AimBlend>,
     bones: Query<&GlobalTransform, With<super::rig::CharacterBone>>,
-    mut cam: Query<(&Transform, &mut Projection), With<crate::CullCamera>>,
+    mut cam: Query<(&Transform, &mut Projection, Option<&CameraBoom>), With<crate::CullCamera>>,
     mut offsets: Query<&mut Transform, (Without<crate::CullCamera>, Without<super::rig::CharacterBone>)>,
 ) {
     let Some(aim) = aim else { return };
@@ -588,12 +588,20 @@ pub fn aim_down_sights(
         return;
     }
     let Ok(bone_gt) = bones.get(aim.bone) else { return };
-    let Ok((cam_tf, mut proj)) = cam.single_mut() else { return };
+    let Ok((cam_tf, mut proj, boom)) = cam.single_mut() else { return };
     // Put the sight ON the eye by moving the WEAPON, not the view: the offset that satisfies
     //     bone_world * offset * anchor == camera
     // is `offset = bone_world^-1 * camera * anchor^-1`. Eased from identity by the blend, so the
     // gun rises into the sight picture instead of teleporting.
-    let cam_world = Transform::from_translation(cam_tf.translation).with_rotation(cam_tf.rotation);
+    // SOLVE AGAINST THE EYE, NOT THE BOOM. This system is ordered `.after(drive_character)`, and
+    // drive_character has already added the third-person boom to the camera transform. Reading it
+    // raw therefore aims the weapon at a point metres behind and above the head, so in third person
+    // the sight lines up with the boom camera rather than with the character's eye - and the more
+    // the boom is extended, the further out the gun swings. `CameraBoom::applied` is exactly what
+    // was added, so subtracting it recovers the eye. In first person `applied` is zero and this is
+    // a no-op, which is why it read as correct.
+    let eye = cam_tf.translation - boom.map(|b| b.applied).unwrap_or(Vec3::ZERO);
+    let cam_world = Transform::from_translation(eye).with_rotation(cam_tf.rotation);
     let want = Transform::from_matrix(
         bone_gt.to_matrix().inverse()
             * cam_world.to_matrix()
