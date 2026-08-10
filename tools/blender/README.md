@@ -80,6 +80,7 @@ in that file.
 | `import_eftlights.py` | in Blender | the practical lights from every `lights_*.json` sidecar, with Unity intensity converted to watts |
 | `terrain_splat.py` | in Blender | rebuilds terrain materials as the real MicroSplat blend |
 | `cine_camera.py` | in Blender | solves a follow camera over the whole shot (Viterbi over candidate positions), plus `cinematic_render_settings` |
+| `weapon_hold.py` | anywhere | keeps the hands on the weapon when clips are stitched. numpy only, no `bpy`, so the solve is testable outside Blender. Two corrections: it carries the weapon socket across the 33 clips that key no `Weapon_root` at all, and it solves both arms back onto the authored grip after a cross-fade. See `docs/extraction/characters-and-animation.md` §14 |
 | `nav_route.py` | anywhere | routes between points on the pack's baked nav grid. numpy only, no `bpy`. A port of the viewer's router, not an approximation |
 | `eft_grade.py` | anywhere | the game's display chain (exposure, shaper, 64-cube LUT, vignette) applied to linear EXR, plus the AgX and filmic looks and the photoreal metering, optical vignette and grain stages. `--selfcheck-agx` diffs its AgX against Blender's own OCIO |
 | `bake_cavity.py` | outside Blender | Poisson-integrates every normal map the pack ships into a multi-scale cavity map for `import_eftpack(cavity_dir=)`. Photoreal only: the game shader has no AO term at any scale |
