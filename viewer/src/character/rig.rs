@@ -26,6 +26,55 @@ use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use std::collections::HashMap;
 
+/// Rest-pose world rotation per bone, from the skeleton's own local chain.
+///
+/// `parents[i] < i` is asserted by the loader, so one forward pass is enough.
+fn rest_world_rotations(pack: &CharacterPack) -> Vec<Quat> {
+    let mut out: Vec<Quat> = Vec::with_capacity(pack.bones.len());
+    for b in pack.bones.iter() {
+        let r = match b.parent {
+            Some(p) => out[p] * b.local_rot,
+            None => b.local_rot,
+        };
+        out.push(r);
+    }
+    out
+}
+
+/// The constant rotation carrying a bone's own frame onto the frame rigid EQUIPMENT is authored in.
+///
+/// An equipment prefab is authored Unity-style: +Y up, +Z forward, +X right. A BONE frame is
+/// whatever the rigger chose, and on this rig that is +X down the bone -- so hanging a Y-up item
+/// straight off the bone tips it by 90 degrees, which puts a helmet's crown out through the face.
+/// Getting up right is only half of it: the remaining two axes are fixed by the bone's ROLL, which
+/// has nothing to do with which way a face points, so an item can sit crown-up and still be yawed
+/// 90 degrees -- a headset across the skull, a ballcap peak over the ear.
+///
+/// So the socket is DERIVED rather than picked. At the rest pose the character stands upright and
+/// faces `pack.forward`, which fixes all three axes:
+///
+///     up = +Y,  forward = pack.forward (levelled),  right = up x forward
+///
+/// and the socket is the constant rotation carrying the bone's rest basis onto that. Being
+/// bone-local it rides the animation unchanged, and being derived it is equally right for a cap on
+/// the head, a pack on `Base HumanBackpack` and an armband on a forearm, none of which share a roll
+/// convention. This mirrors `tools/blender/import_eftchar.py::_socket_basis`; the two renderers must
+/// agree or a pack looks different in Blender than it does here.
+///
+/// NOTE the WEAPON does not use this. It is authored in the ENGINE bone frame and rides
+/// `Weapon_root` directly -- attach each thing in the frame it was authored in.
+fn socket_basis(rest: Quat, forward: Vec3) -> Quat {
+    let up = Vec3::Y;
+    let f = forward - up * forward.dot(up);
+    if f.length_squared() < 1.0e-12 {
+        return Quat::IDENTITY;
+    }
+    let f = f.normalize();
+    let right = up.cross(f).normalize();
+    let desired = Quat::from_mat3(&Mat3::from_cols(right, up, f));
+    (rest.inverse() * desired).normalize()
+}
+
 /// What [`spawn`] hands back: the root entity plus the bone entities in rig order, so a caller
 /// can parent something to a named socket (the weapon rides `Weapon_root`) without waiting a
 /// frame for the deferred `CharacterRoot` component to become readable.
@@ -270,11 +319,18 @@ pub fn spawn(
     // hierarchy does the rest, so an attachment follows the head through every animation with no
     // per-frame work here.
     let mut spawned_attachments = 0usize;
+    let rest_rot = rest_world_rotations(pack);
     for att in &pack.attachments {
         if att.lod != lod {
             continue;
         }
         let Some(parent) = bone_entities.get(att.bone).copied() else { continue };
+        // Carry the item into the frame it was authored in (see `socket_basis`). A pure rotation,
+        // so it composes with the prefab-local transform by rotating its translation too.
+        let socket = socket_basis(
+            rest_rot.get(att.bone).copied().unwrap_or(Quat::IDENTITY),
+            pack.forward,
+        );
         for sub in &att.submeshes {
             if sub.index_count == 0 {
                 continue;
@@ -294,8 +350,8 @@ pub fn spawn(
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(material),
                 Transform {
-                    translation: att.local.0,
-                    rotation: att.local.1,
+                    translation: socket * att.local.0,
+                    rotation: socket * att.local.1,
                     scale: att.local.2,
                 },
                 Visibility::default(),
