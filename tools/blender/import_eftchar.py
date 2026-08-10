@@ -567,6 +567,153 @@ def _slice_indices(pack, md):
     return np.frombuffer(pack.skin, dtype="<u4", count=n, offset=off).astype(np.int64)
 
 
+def _build_attachment(pack, ad, mats, bone_names, arm_obj, collection, prefix):
+    """A RIGID equipment mesh that rides one bone: a helmet, a cap, goggles, a face cover.
+
+    These prefabs are `MeshFilter` + `MeshRenderer` with no bindposes and no bone hashes, so they
+    do not deform - they hang off a bone the way the weapon does, and the pack carries the local
+    transform composed down from the prefab root (`extraction/characters/skin.py::Attachment`).
+
+    THE BONE-AXIS TRAP, AND WHY IT RESOLVES THE OPPOSITE WAY FROM THE WEAPON.  `import_eftweap`
+    undoes the importer's `q4` bone-axis correction, because the weapon is authored in the ENGINE's
+    bone frame and `pose.matrix @ q4_inverse` is what recovers that frame.  Applying the same undo
+    here tips a helmet's crown forwards, and the measurement says exactly why:
+
+        head bone, ENGINE frame     +X -> world (0.00, -0.36, +0.93)   up the skull
+                                    +Y -> world (0.00, -0.93, -0.36)   forward and down
+        head bone, BLENDER frame    +Y -> world (0.00, -0.36, +0.93)   up the skull
+
+    This rig is +X-down-the-bone, so in the engine frame the skull's up is +X.  But an equipment
+    prefab is authored UNITY Y-UP - every one of these items is a root at identity above a mesh node
+    carrying a single -90 deg X rotation, which is precisely the DCC-Z-up -> Unity-Y-up fixup, so
+    the item's own up is +Y.  Hanging a Y-up item in an X-up frame rotates it by exactly the 90
+    degrees that puts the crown where the face should be.
+
+    Blender's bone convention (+Y along the bone) happens to be the one the items already use,
+    which is what `q4` was constructed to produce - so the correct frame here is `pose.matrix`
+    ITSELF, with no undo.  The two rules are consistent: attach each thing in the frame it was
+    authored in.
+
+    (The runtime's own placement is not recoverable from the asset - the slot -> bone mapping lives
+    in `PlayerBody.SlotView`, which is code - so `extraction/characters/kit_parts.py` authors the
+    bone and this authors the frame, both flagged as choices.)
+
+    Rather than derive Blender's bone-parent offset, assign the world matrix we want and let Blender
+    back-solve the local basis - the result is expressed in bone space, so it stays correct for
+    every frame of the animation.
+    """
+    pos, nrm, uv, _ji, _jw = _slice_vertices(pack, ad)
+    idx = _slice_indices(pack, ad)
+    if idx.size and int(idx.max()) >= pos.shape[0]:
+        raise ValueError("%s: index %d exceeds vertexCount" % (ad["name"], int(idx.max())))
+
+    tris = idx.reshape(-1, 3)
+    me = bpy.data.meshes.new(prefix + ad["name"])
+    me.from_pydata(pos.tolist(), [], tris.tolist())
+    me.update()
+    me.validate(verbose=False, clean_customdata=False)
+
+    uv_l = uv.copy()
+    if pack.uv_v_flipped:
+        uv_l[:, 1] = 1.0 - uv_l[:, 1]
+    lay = me.uv_layers.new(name="UVMap")
+    loop_v = np.empty(len(me.loops), dtype=np.int64)
+    me.loops.foreach_get("vertex_index", loop_v)
+    lay.data.foreach_set("uv", uv_l[loop_v].astype(np.float32).ravel())
+    me.polygons.foreach_set("use_smooth", [True] * len(me.polygons))
+    try:
+        me.normals_split_custom_set_from_vertices([tuple(n) for n in nrm])
+    except Exception:
+        pass
+
+    used, slot_of = [], {}
+    for sub in ad.get("submeshes", []):
+        mi = int(sub["material"])
+        if mi not in slot_of:
+            slot_of[mi] = len(used)
+            used.append(mi)
+            me.materials.append(mats.get(mi))
+    if used:
+        polys = np.zeros(len(me.polygons), dtype=np.int32)
+        for sub in ad.get("submeshes", []):
+            a = int(sub["indexStart"]) // 3
+            b = a + int(sub["indexCount"]) // 3
+            polys[a:b] = slot_of[int(sub["material"])]
+        me.polygons.foreach_set("material_index", polys)
+
+    obj = bpy.data.objects.new(prefix + ad["name"], me)
+    (collection or bpy.context.scene.collection).objects.link(obj)
+
+    bi = int(ad["bone"])
+    if bi < 0 or bi >= len(bone_names):
+        print("[eftchar] WARNING attachment %s targets bone %d, out of range" % (ad["name"], bi))
+        return obj, pos.shape[0], tris.shape[0]
+    bname = bone_names[bi]
+    pb = arm_obj.pose.bones.get(bname)
+    if pb is None:
+        print("[eftchar] WARNING attachment %s: no pose bone %r" % (ad["name"], bname))
+        return obj, pos.shape[0], tris.shape[0]
+
+    local = _compose(ad.get("localPos", [0, 0, 0]),
+                     ad.get("localRot", [0, 0, 0, 1]),
+                     ad.get("localScale", [1, 1, 1]))
+    fwd = pack.m.get("characterForward") or [0.0, 0.0, 1.0]
+    socket = _socket_basis(arm_obj, bname, fwd)
+    obj.parent = arm_obj
+    obj.parent_type = 'BONE'
+    obj.parent_bone = bname
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    bpy.context.view_layer.update()
+    obj.matrix_world = arm_obj.matrix_world @ pb.matrix @ _to_bl(socket) @ _to_bl(local)
+    return obj, pos.shape[0], tris.shape[0]
+
+
+def _socket_basis(arm_obj, bone_name, forward_pack):
+    """The constant rotation that turns a bone's own frame into the frame ITEMS are authored in.
+
+    Getting the item's UP right is only half of it.  A bone frame has three axes and the other two
+    are fixed by the bone's ROLL, which is a rigging convention with nothing to do with which way
+    the face points - so an item can sit crown-up and still be yawed 90 degrees, which is a headset
+    across the skull sideways and a ballcap with its peak out over the ear.
+
+    Rather than add a second hand-picked 90 degrees, DERIVE the socket.  An equipment prefab is
+    authored Unity-style: +Y up, +Z forward, +X right.  The rig, at BIND pose, tells us where those
+    directions actually are - the character stands upright and faces `characterForward`, both in
+    pack space - so the desired world basis is fully determined:
+
+        up      = pack +Y
+        forward = pack `characterForward` (manifest, derived from a walk clip's root motion)
+        right   = up x forward                  (right-handed, matching the item's own convention)
+
+    The socket is then whatever constant rotation carries the bone's REST basis onto that, i.e.
+    `rest_rotation^-1 @ desired`.  Being expressed in bone-local space it rides the animation
+    unchanged, and being derived per bone it is equally right for a cap on the head, a pack on
+    `Base HumanBackpack` and an armband on a forearm, none of which share a roll convention.
+    """
+    b = arm_obj.data.bones.get(bone_name)
+    if b is None:
+        return np.eye(4)
+    up = np.array([0.0, 1.0, 0.0])
+    fwd = np.asarray(forward_pack, dtype=np.float64)
+    fwd = fwd - up * float(fwd @ up)
+    n = np.linalg.norm(fwd)
+    if n < 1e-6:
+        return np.eye(4)
+    fwd /= n
+    right = np.cross(up, fwd)
+    desired = np.eye(4)
+    desired[:3, 0] = right
+    desired[:3, 1] = up
+    desired[:3, 2] = fwd
+    rest = np.array([[float(v) for v in row] for row in b.matrix_local])
+    r3 = rest[:3, :3]
+    s = np.linalg.norm(r3, axis=0)
+    s = np.where(s < 1e-12, 1.0, s)
+    rest_rot = np.eye(4)
+    rest_rot[:3, :3] = r3 / s[None, :]
+    return np.linalg.inv(rest_rot) @ desired
+
+
 def _build_mesh(pack, md, t_r, mats, bone_names, arm_obj, collection, prefix):
     pos, nrm, uv, ji, jw = _slice_vertices(pack, md)
     idx = _slice_indices(pack, md)
@@ -904,6 +1051,21 @@ def import_eftchar(char_dir, clip_name=None, loops=1, name_prefix="",
         n_t += t
         n_w += w
 
+    n_att_built = 0
+    for ad in (pack.m.get("attachments") or []):
+        if want_lod is not None and int(ad.get("lod", 0)) != want_lod:
+            skipped += 1
+            continue
+        if mesh_filter is not None and not mesh_filter(ad["name"]):
+            skipped += 1
+            continue
+        obj, v, t = _build_attachment(pack, ad, mats, bone_names, arm_obj, coll, name_prefix)
+        if obj is not None:
+            mesh_objs.append(obj)
+            n_att_built += 1
+            n_v += v
+            n_t += t
+
     clip = _pick_clip(pack, clip_name)
     action = None
     last = 1
@@ -936,8 +1098,8 @@ def import_eftchar(char_dir, clip_name=None, loops=1, name_prefix="",
           % (len(mats), len(pack.m.get("textures") or []), pack.uv_v_flipped))
     n_att = len(pack.m.get("attachments") or [])
     if n_att:
-        print("[eftchar] NOTE       %d attachment(s) NOT imported (bone-pinned rigid geometry)"
-              % n_att)
+        print("[eftchar] equipment  %d/%d rigid attachment(s) imported (bone-pinned)"
+              % (n_att_built, n_att))
     if clip is not None:
         print("[eftchar] clip       '%s'  %d frames @ %.1f Hz  %.3f s  loop=%s  tracks=%d"
               % (clip["name"], int(clip["frameCount"]), float(clip.get("sampleRate", 0.0)),

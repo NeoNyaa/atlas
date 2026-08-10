@@ -53,3 +53,14 @@ The rules most often got wrong, so that a wrong turn is caught before the full r
   so two basis renders span the space.
 - A spatial filter tests an instance's world AABB, never its centre or its translation. Pre-baked
   geometry ships an identity affine, and a 700 m terrain tile is larger than any radius.
+- **Attach a thing in the frame it was AUTHORED in, and there is more than one.** The weapon is
+  authored in the ENGINE bone frame, so it undoes the importer's `q4` bone-axis permutation. Rigid
+  equipment is authored UNITY Y-UP (a prefab root at identity over a mesh node carrying one -90 deg
+  X fixup), so it does not. This rig is +X-down-the-bone, so those two frames differ by exactly 90
+  degrees: use the weapon's rule on a helmet and the crown points forward out of the face. Nothing
+  errors, because the geometry is present, watertight and correctly textured, and only a render
+  shows it.
+- A whole class of bug here is SILENT: geometry composed in the wrong frame is never missing, only
+  rotated or offset. When touching any frame, write down next to the code which frame each side is
+  in, and verify by MEASURING a known axis (the head bone's up against the skull's) rather than by
+  reading the render.

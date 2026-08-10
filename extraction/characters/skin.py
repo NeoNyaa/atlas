@@ -19,6 +19,7 @@ so assembling a character is "spawn the rig once, attach N meshes".
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -350,6 +351,8 @@ def load_part(
     material_base: int,
     strict: bool = True,
     lods: Optional[Sequence[int]] = None,
+    skip_unskinned: bool = False,
+    resolve_deps: bool = True,
 ) -> PartResult:
     """Read one part bundle. `material_base` is the pack-wide index the first emitted material takes.
 
@@ -358,7 +361,37 @@ def load_part(
     import UnityPy
     from UnityPy.helpers.MeshHelper import MeshHandler
 
-    env = UnityPy.load(bundle_path)
+    # RESOLVE CAB DEPENDENCIES, not just the one bundle.
+    #
+    # A body prefab is self-contained, so a bare `UnityPy.load` was enough and nothing showed. An
+    # EQUIPMENT prefab often is not: `item_equipment_armor_6b23_mflora.bundle` carries no `Mesh` at
+    # all (the geometry is in a neighbour) and the ULACH helmet and the 6B34 glasses carry their
+    # materials but not the `Texture2D` those materials point at. Both failures are silent in
+    # different ways - the first raised "no Mesh objects" and lost the whole item, the second
+    # produced a material with an empty texture set that renders PURE WHITE, which is what put a
+    # blank white face on a rendered operative.
+    #
+    # GEOMETRY still comes from the CONTAINER ONLY. Dependency bundles are shared and carry
+    # unrelated assets, so baking everything in `env` would drag a neighbour's meshes into this
+    # part (the weapon builder learned the same lesson). Materials and textures are looked up
+    # across the whole env, because that is exactly the cross-bundle reference being repaired, and
+    # a dependency entry is only consulted for a path_id the container did not already define -
+    # path_ids are per-file, so preferring the container's own is what keeps a collision from
+    # silently binding a stranger's texture.
+    own_ids = None
+    if resolve_deps:
+        import unity_deps
+        env = UnityPy.Environment()
+        try:
+            own, _n = unity_deps.resolve_into(env, bundle_path, unity_deps.load(verbose=False))
+            own_ids = {id(o) for o in own}
+        except Exception as exc:
+            print(f"  [deps] {os.path.basename(bundle_path)}: dependency resolve failed ({exc}); "
+                  f"falling back to the single bundle")
+            env = UnityPy.load(bundle_path)
+            own_ids = None
+    else:
+        env = UnityPy.load(bundle_path)
     result = PartResult()
 
     # ---- pass 1: index the bundle -------------------------------------------------
@@ -368,18 +401,43 @@ def load_part(
     texs_by_pathid: Dict[int, object] = {}
     skins: List[dict] = []
 
-    for obj in env.objects:
+    def _is_own(o):
+        return own_ids is None or id(o) in own_ids
+
+    # WHICH MESHES ARE OURS is not "the ones in this file". `item_equipment_armor_6b23_mflora`
+    # contains no `Mesh` at all: both its SkinnedMeshRenderers point at `m_FileID: 1`, an EXTERNAL
+    # file, and the geometry lives in a dependency. So "meshes from the container only" loses the
+    # item entirely, while "every mesh in the env" drags in the neighbours that share that bundle.
+    # The precise rule is the meshes THIS PREFAB'S OWN RENDERERS REFERENCE, by path_id.
+    wanted_mesh_ids = set()
+    for o in env.objects:
+        if not _is_own(o) or o.type.name not in ("SkinnedMeshRenderer", "MeshFilter"):
+            continue
+        try:
+            pid = int((o.read_typetree().get("m_Mesh") or {}).get("m_PathID", 0))
+        except Exception:
+            continue
+        if pid:
+            wanted_mesh_ids.add(pid)
+
+    for obj in sorted(env.objects, key=lambda o: 0 if _is_own(o) else 1):
         tname = obj.type.name
+        mine = _is_own(obj)
         if tname == "Mesh":
-            meshes.append((obj, obj.read_typetree()))
+            if mine or obj.path_id in wanted_mesh_ids:
+                meshes.append((obj, obj.read_typetree()))
         elif tname == "SkinnedMeshRenderer":
-            smrs.append(obj.read_typetree())
+            if mine:
+                smrs.append(obj.read_typetree())
         elif tname == "Material":
-            mats_by_pathid[obj.path_id] = obj.read_typetree()
+            if mine or obj.path_id not in mats_by_pathid:
+                mats_by_pathid[obj.path_id] = obj.read_typetree()
         elif tname == "Texture2D":
-            texs_by_pathid[obj.path_id] = obj
+            if mine or obj.path_id not in texs_by_pathid:
+                texs_by_pathid[obj.path_id] = obj
         elif tname == "MonoBehaviour" and _script_name(obj) == "Skin":
-            skins.append(obj.read_typetree())
+            if mine:
+                skins.append(obj.read_typetree())
 
     if not meshes:
         raise RuntimeError(f"{bundle_path}: no Mesh objects")
@@ -466,6 +524,15 @@ def load_part(
         )
 
         if not handler.m_BoneIndices or not handler.m_BoneWeights:
+            if skip_unskinned:
+                # An EQUIPMENT prefab is not one renderer. `item_equipment_backpack_wartech` ships
+                # the worn `SkinnedMeshRenderer` AND `BP_WarTech_Drop_SHADOW_lod0`, the rigid
+                # dropped-on-the-ground proxy, in the same bundle; a chest rig ships its pouches the
+                # same way. Those carry no weights and are not what the character wears, so on the
+                # equipment path they are skipped rather than failing the whole part. A BODY part
+                # keeps the hard error: a body mesh with no weights is a real corruption.
+                print(f"  [skip] {name}: no skin weights (rigid proxy in a skinned prefab)")
+                continue
             raise RuntimeError(
                 f"{name}: no skin weights in the vertex data -- this is not a skinned mesh"
             )
@@ -583,7 +650,23 @@ def load_attachment(
     import UnityPy
     from UnityPy.helpers.MeshHelper import MeshHandler
 
-    env = UnityPy.load(bundle_path)
+    # Same cross-bundle repair as `load_part`, and needed for the same reason: the ULACH helmet
+    # ships its Material but not the Texture2D it points at, so a single-bundle load produced an
+    # empty texture set and rendered a pure white helmet over the operative's face. Geometry is
+    # still taken from the CONTAINER only; materials and textures may come from a dependency, and
+    # a dependency entry is consulted only for a path_id the container did not already define.
+    own_ids = None
+    try:
+        import unity_deps
+        env = UnityPy.Environment()
+        own, _n = unity_deps.resolve_into(env, bundle_path, unity_deps.load(verbose=False))
+        own_ids = {id(o) for o in own}
+    except Exception as exc:
+        print(f"  [deps] {os.path.basename(bundle_path)}: dependency resolve failed ({exc}); "
+              f"falling back to the single bundle")
+        env = UnityPy.load(bundle_path)
+        own_ids = None
+
     meshes: List[Tuple[object, dict]] = []
     renderers: List[dict] = []
     filters: Dict[int, dict] = {}
@@ -592,8 +675,28 @@ def load_attachment(
     tfs: Dict[int, dict] = {}
     gos: Dict[int, dict] = {}
 
-    for obj in env.objects:
+    def _is_own(o):
+        return own_ids is None or id(o) in own_ids
+
+    wanted_mesh_ids = set()
+    for o in env.objects:
+        if not _is_own(o) or o.type.name not in ("MeshFilter", "SkinnedMeshRenderer"):
+            continue
+        try:
+            pid = int((o.read_typetree().get("m_Mesh") or {}).get("m_PathID", 0))
+        except Exception:
+            continue
+        if pid:
+            wanted_mesh_ids.add(pid)
+
+    for obj in sorted(env.objects, key=lambda o: 0 if _is_own(o) else 1):
         t = obj.type.name
+        mine = _is_own(obj)
+        if t == "Mesh":
+            if not (mine or obj.path_id in wanted_mesh_ids):
+                continue
+        elif t in ("MeshRenderer", "MeshFilter", "Transform", "GameObject") and not mine:
+            continue
         if t == "Mesh":
             meshes.append((obj, obj.read_typetree()))
         elif t == "MeshRenderer":
@@ -601,9 +704,11 @@ def load_attachment(
         elif t == "MeshFilter":
             filters[obj.path_id] = obj.read_typetree()
         elif t == "Material":
-            mats_by_pathid[obj.path_id] = obj.read_typetree()
+            if mine or obj.path_id not in mats_by_pathid:
+                mats_by_pathid[obj.path_id] = obj.read_typetree()
         elif t == "Texture2D":
-            texs_by_pathid[obj.path_id] = obj
+            if mine or obj.path_id not in texs_by_pathid:
+                texs_by_pathid[obj.path_id] = obj
         elif t == "Transform":
             tfs[obj.path_id] = obj.read_typetree()
         elif t == "GameObject":

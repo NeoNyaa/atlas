@@ -330,6 +330,36 @@ Every attachment vertex is pinned to the target bone with full weight (`jointInd
 
 **The slot→bone mapping is NOT in the asset.** The `Dress` component lists only renderers and a decal type; the real mapping lives in the runtime's `PlayerBody.SlotView`. So the target bone comes from the registry (`extraction/characters/characters.json`, e.g. `"bone": "Base HumanHead"` → index 24) and is an explicit authoring choice, flagged as such. This is the one place in the character pipeline where a value is authored rather than derived.
 
+**WHICH FRAME THE CONSUMER COMPOSES IT IN is the other authored half, and it is not the weapon's.**
+Storing `localRot` says nothing about what it is local *to*, and the two obvious answers differ by
+exactly 90 degrees on this rig:
+
+| thing | authored in | consumer composes |
+|---|---|---|
+| the weapon (`.eftweap`) | the ENGINE bone frame | `pose.matrix @ q4⁻¹ @ local` - undo the importer's bone-axis permutation (`tools/blender/import_eftweap.py:222-239`) |
+| rigid equipment (attachment) | UNITY Y-UP | `pose.matrix @ local` - no undo (`tools/blender/import_eftchar.py::_build_attachment`) |
+
+The reason is that this rig is **+X-down-the-bone**, so `q4` (the signed permutation carrying the
+rig's dominant bone axis to Blender's +Y) is a 90° rotation, and the two frames disagree by it.
+Measured on `out/characters/kit_bear_5`, head bone at bind pose:
+
+```
+ENGINE  (pose.matrix @ q4⁻¹)   +X -> world (0.00, -0.36, +0.93)   up the skull
+                               +Y -> world (0.00, -0.93, -0.36)   forward and down
+BLENDER (pose.matrix)          +Y -> world (0.00, -0.36, +0.93)   up the skull
+```
+
+An equipment prefab is authored Unity Y-up - verified identical on `cap_BEAR`,
+`item_equipment_helmet_LSHZ` and `item_equipment_helmet_ULACH_coyote`, each a prefab root at
+identity above a mesh node carrying a single −90° X rotation, which is the DCC-Z-up → Unity-Y-up
+fixup. So the item's own up is +Y, and hanging it in an X-up frame tips the crown forward out of the
+face. Nothing errors: the geometry is present, watertight and correctly textured, and only a render
+shows it.
+
+**`viewer/src/character/rig.rs:293-306` spawns attachments as children of a bone entity carrying
+`att.local` directly**, so whether Atlas is correct depends on which frame its bone entities are in;
+if they are the engine/skeleton frame, the viewer tips helmets the same way.
+
 The weapon uses a different mechanism: no attachment record at all. The consumer looks up the rig bone named `Weapon_root` (measured index 68) and parents the `.eftweap` mesh under an identity offset node (`viewer/src/character/weapon.rs:21`, `viewer/src/character/mod.rs:171-226`). The rig also ships `weapon_holster` (75) and `weapon_holster1` (76) for the slung pose.
 
 ---
@@ -544,6 +574,7 @@ The "what you SEE" column records observations from the source notes taken when 
 | bone remap from the authoritative source | trusting `Skin._bonePaths` over `Mesh.m_BoneNameHashes` | limbs animate to the wrong joints - an arm follows the leg. Recorded shipped disagreements: `usec_upper_commando` shifted two slots, `Top_BOSS_Killa_base` a different length (49 vs 48) |
 | `parents[i] < i` | unsorted hierarchy | a forward-pass world-matrix computation reads a parent that has not been written yet: children lag one frame or jitter. Both emitter and loader assert it |
 | binding curve widths sum to the clip's curve count | assuming a width, or ignoring the euler attribute | curves are read one slot off; the animation is smooth, connected, unit-quaternion clean, and completely wrong. The build fails on the sum mismatch |
+| an attachment composed in the frame it was AUTHORED in | using the weapon's rule on rigid equipment, i.e. undoing the `q4` bone-axis permutation | the item is present, watertight and correctly textured, and rotated 90 degrees: a helmet's crown points forward out of the face, a cap sits on the cheek. This rig is +X-down-the-bone so the ENGINE bone frame has +X up the skull, while an equipment prefab is authored Unity Y-UP - the two differ by exactly the 90 degrees you see. Measured on the head bone at bind: engine +X and Blender +Y both map to world (0.00, -0.36, +0.93) |
 | hands solved onto the weapon after a cross-fade | leaving the raw local blend | the rifle floats out of the grip for the length of the fade - the left fist hangs in mid-air below the magwell and the gun hovers over a closed right hand. Peaks at 90-204 mm on this pack, and motion blur on a final render HIDES it, so it survives review and shows up in playback |
 | root motion stripped once | leaving it in the track AND moving the character | the body slides out from under the camera along the clip's own axis |
 | clip resolved by controller id, not name | resolving by name | you get the additive-DELTA twin of a clip and play its deltas as absolute poses; the character folds only in the states that happen to hit the duplicate |
