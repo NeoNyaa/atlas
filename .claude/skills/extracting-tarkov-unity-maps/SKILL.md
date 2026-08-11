@@ -56,6 +56,12 @@ The rules most often got wrong, so that a wrong turn is caught before the full r
 - The pack ships no sun and no directional light at all. Sun and sky strength for an offline render
   are SOLVED against a viewer frame, never guessed; a path tracer is linear in each light's power,
   so two basis renders span the space.
+- The shipped sky is a 128 px/face reflection CAPTURE with a treeline baked into its horizon: the
+  right thing to light with, the wrong thing to look at. Photoreal mode splits those two roles with
+  `Light Path > Is Camera Ray` so the fitted sun/sky pair is untouched (verified bit-identical, not
+  argued). Anything that changes the backdrop's appearance must re-run `fit_sky_backdrop.py`, and
+  that fit is over the solid-angle-weighted HEMISPHERE: measured on one frame the same comparison
+  gives 18.9x level and 2.2x the other way pitched up, i.e. it fits the framing, not the sky.
 - A spatial filter tests an instance's world AABB, never its centre or its translation. Pre-baked
   geometry ships an identity affine, and a 700 m terrain tile is larger than any radius.
 - **Attach a thing in the frame it was AUTHORED in, and there is more than one.** The weapon is
