@@ -344,6 +344,33 @@ def _pack_vertices(
 # ---------------------------------------------------------------------------
 # main entry
 # ---------------------------------------------------------------------------
+def _resolved_material(idx, result, material_base, first_textured):
+    """The material a submesh should actually wear.
+
+    A submesh whose material resolved to NO textures at all is a binding failure, not an artistic
+    choice, and there are two ways to get one. A mesh with no renderer in the loaded env falls back
+    to whatever material was indexed first, which after dependency resolution can be a SHADOW caster
+    proxy. And a mesh matched to a DEPENDENCY renderer can be pointed at Unity's `Default-Material`,
+    whose nine texture slots all resolve to nothing, while the container's own renderer names the
+    real five-slot material - measured on `item_equipment_rig_6b5_flora`.
+
+    Both produce the same visible result: a worn item rendered flat and untextured. So both are
+    treated the same way, and the part's first REAL material is used instead.
+
+    The cost is that a genuinely texture-less material gets replaced. That is acceptable because
+    such a material renders as a flat blank anyway, and it is loud rather than silent: an item that
+    should be blank now shows the part's own albedo, which is obvious in a render, whereas the
+    failure it replaces looked like a missing texture and was not.
+    """
+    if idx is None:
+        return first_textured if first_textured is not None else material_base
+    local = idx - material_base
+    if 0 <= local < len(result.materials) and not result.materials[local].textures:
+        if first_textured is not None:
+            return first_textured
+    return idx
+
+
 def load_part(
     bundle_path: str,
     part_name: str,
@@ -398,6 +425,7 @@ def load_part(
     meshes: List[Tuple[object, dict]] = []  # (object_reader, typetree)
     smrs: List[dict] = []
     mats_by_pathid: Dict[int, dict] = {}
+    mat_candidates: Dict[int, list] = {}
     texs_by_pathid: Dict[int, object] = {}
     skins: List[dict] = []
 
@@ -427,11 +455,30 @@ def load_part(
             if mine or obj.path_id in wanted_mesh_ids:
                 meshes.append((obj, obj.read_typetree()))
         elif tname == "SkinnedMeshRenderer":
-            if mine:
-                smrs.append(obj.read_typetree())
+            # INDEX EVERY RENDERER, not just the container's. Geometry is still restricted to the
+            # meshes the container's own renderers reference (`wanted_mesh_ids`), but the RENDERER
+            # that owns such a mesh can itself live in the dependency - and it is the only thing
+            # that says which material the mesh wears. Missing it made `smr_by_mesh` come up empty,
+            # `smr_mats` empty, and the material fall back to `material_base`, which after
+            # dependency resolution is whatever material happened to be indexed first: for
+            # `item_equipment_backpack_takedown_sling` that was a SHADOW_2SIDED caster proxy, so
+            # the USEC's backpack rendered untextured while its real 5-slot material sat unused.
+            smrs.append((bool(mine), obj.read_typetree()))
         elif tname == "Material":
+            # PATH IDS ARE PER FILE, so one dict keyed by path_id alone is a collision waiting to
+            # happen once dependencies are loaded - and it happened: `item_equipment_backpack_
+            # takedown_sling`'s renderers reference a material that lives in a dependency and has 5
+            # texture slots, while a SHADOW_2SIDED caster proxy in another loaded file carries the
+            # SAME path_id. The shadow won and the USEC's backpack rendered untextured.
+            #
+            # Keep every candidate. The tiebreak below prefers the container's own, then the one
+            # that actually has textures: a shadow-caster proxy has none by construction, so it can
+            # never displace a real material.
+            tt_m = obj.read_typetree()
+            n_tex = len((tt_m.get("m_SavedProperties") or {}).get("m_TexEnvs") or [])
+            mat_candidates.setdefault(obj.path_id, []).append((bool(mine), n_tex, tt_m))
             if mine or obj.path_id not in mats_by_pathid:
-                mats_by_pathid[obj.path_id] = obj.read_typetree()
+                mats_by_pathid[obj.path_id] = tt_m
         elif tname == "Texture2D":
             if mine or obj.path_id not in texs_by_pathid:
                 texs_by_pathid[obj.path_id] = obj
@@ -445,6 +492,20 @@ def load_part(
     # ---- materials + textures ----------------------------------------------------
     #: Material path_id -> pack material index. SMRs reference materials by PPtr.
     mat_index: Dict[int, int] = {}
+    # Resolve each collision: container's own first, then most texture slots.
+    for pid, cands in mat_candidates.items():
+        if len(cands) > 1:
+            best = max(cands, key=lambda c: (c[0], c[1]))
+            if best[2] is not mats_by_pathid.get(pid):
+                mats_by_pathid[pid] = best[2]
+                print("  [mat] path_id %d had %d candidates; kept %r (%d texture slots)"
+                      % (pid, len(cands), str(best[2].get("m_Name")), best[1]))
+    # The fallback for a mesh whose renderer is not in the env must be a REAL material. Before
+    # dependency resolution the part's first material was its own and textured, so `material_base`
+    # was a safe default; now the first indexed material can be a SHADOW caster proxy pulled in from
+    # a neighbour, and three of the takedown sling's four cuts - genuine variants, 5,194 verts each,
+    # not proxies - landed on it and rendered untextured.
+    first_textured = None
     for pid, mt in mats_by_pathid.items():
         mat = Material(name=str(mt.get("m_Name", f"material_{pid}")))
         saved = mt.get("m_SavedProperties", {}) or {}
@@ -475,15 +536,31 @@ def load_part(
                 float(c.get("b", 1.0)),
                 float(c.get("a", 1.0)),
             ]
+        if first_textured is None and mat.textures:
+            first_textured = material_base + len(result.materials)
         mat_index[pid] = material_base + len(result.materials)
         result.materials.append(mat)
 
     # ---- SMR lookup: mesh path_id -> its renderer (for the material list) --------
+    # SEVERAL renderers can name the same mesh - a worn one and a SHADOW caster proxy - and the
+    # last write used to win, which handed three of the takedown sling's four cuts a texture-less
+    # SHADOW material. Choose deliberately: the container's own renderer first, then the one whose
+    # material actually has texture slots. A caster proxy has none by construction, so it can only
+    # ever be the fallback.
+    def _smr_rank(entry):
+        mine, smr = entry
+        pids = [int((m or {}).get("m_PathID", 0)) for m in (smr.get("m_Materials") or [])]
+        textured = any(
+            len((mats_by_pathid.get(pid, {}).get("m_SavedProperties") or {}).get("m_TexEnvs") or [])
+            for pid in pids
+        )
+        return (1 if mine else 0, 1 if textured else 0)
+
     smr_by_mesh: Dict[int, dict] = {}
-    for smr in smrs:
-        mpid = int((smr.get("m_Mesh") or {}).get("m_PathID", 0))
+    for entry in sorted(smrs, key=_smr_rank):          # best last, so it wins the overwrite
+        mpid = int((entry[1].get("m_Mesh") or {}).get("m_PathID", 0))
         if mpid:
-            smr_by_mesh[mpid] = smr
+            smr_by_mesh[mpid] = entry[1]
 
     # `Skin` bone paths are per renderer; in practice a part has one binding set shared by its
     # LOD meshes, so take the first non-empty and validate per mesh against the hashes.
@@ -609,7 +686,9 @@ def load_part(
             mat_pid = smr_mats[si] if si < len(smr_mats) else (smr_mats[0] if smr_mats else 0)
             submeshes.append(
                 SubMesh(
-                    material=mat_index.get(mat_pid, material_base),
+                    material=_resolved_material(
+                        mat_index.get(mat_pid), result, material_base, first_textured
+                    ),
                     index_start=cursor,
                     index_count=int(seg.size),
                 )
@@ -671,6 +750,7 @@ def load_attachment(
     renderers: List[dict] = []
     filters: Dict[int, dict] = {}
     mats_by_pathid: Dict[int, dict] = {}
+    mat_candidates: Dict[int, list] = {}
     texs_by_pathid: Dict[int, object] = {}
     tfs: Dict[int, dict] = {}
     gos: Dict[int, dict] = {}
@@ -704,8 +784,20 @@ def load_attachment(
         elif t == "MeshFilter":
             filters[obj.path_id] = obj.read_typetree()
         elif t == "Material":
+            # PATH IDS ARE PER FILE, so one dict keyed by path_id alone is a collision waiting to
+            # happen once dependencies are loaded - and it happened: `item_equipment_backpack_
+            # takedown_sling`'s renderers reference a material that lives in a dependency and has 5
+            # texture slots, while a SHADOW_2SIDED caster proxy in another loaded file carries the
+            # SAME path_id. The shadow won and the USEC's backpack rendered untextured.
+            #
+            # Keep every candidate. The tiebreak below prefers the container's own, then the one
+            # that actually has textures: a shadow-caster proxy has none by construction, so it can
+            # never displace a real material.
+            tt_m = obj.read_typetree()
+            n_tex = len((tt_m.get("m_SavedProperties") or {}).get("m_TexEnvs") or [])
+            mat_candidates.setdefault(obj.path_id, []).append((bool(mine), n_tex, tt_m))
             if mine or obj.path_id not in mats_by_pathid:
-                mats_by_pathid[obj.path_id] = obj.read_typetree()
+                mats_by_pathid[obj.path_id] = tt_m
         elif t == "Texture2D":
             if mine or obj.path_id not in texs_by_pathid:
                 texs_by_pathid[obj.path_id] = obj
@@ -717,6 +809,14 @@ def load_attachment(
     materials: List[Material] = []
     images: Dict[str, object] = {}
     mat_index: Dict[int, int] = {}
+    # Resolve each collision: container's own first, then most texture slots.
+    for pid, cands in mat_candidates.items():
+        if len(cands) > 1:
+            best = max(cands, key=lambda c: (c[0], c[1]))
+            if best[2] is not mats_by_pathid.get(pid):
+                mats_by_pathid[pid] = best[2]
+                print("  [mat] path_id %d had %d candidates; kept %r (%d texture slots)"
+                      % (pid, len(cands), str(best[2].get("m_Name")), best[1]))
     for pid, mt in mats_by_pathid.items():
         mat = Material(name=str(mt.get("m_Name", f"material_{pid}")))
         saved = mt.get("m_SavedProperties", {}) or {}

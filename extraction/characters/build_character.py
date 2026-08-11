@@ -538,6 +538,11 @@ def main() -> None:
                          "skinned items (armour, rig, backpack, balaclava) join the skinned parts "
                          "so they deform with the body, rigid items (helmet, cap, goggles, headset) "
                          "become bone-pinned attachments. See kit_parts.py")
+    ap.add_argument("--kit-bot", metavar="BOT",
+                    help="roll the kit from THIS bot's tables when building a named --character. "
+                         "characters.json entries are hand-specced and have no bot type of their "
+                         "own, so a scav built by name could never carry equipment; --kit-bot "
+                         "assault gives it the same table the rolled assault bot uses")
     ap.add_argument("--skip-slot", action="append", default=[], metavar="SLOT",
                     help="do not wear this kit slot at all, e.g. --skip-slot FaceCover")
     ap.add_argument("--prefer", action="append", default=[], metavar="SLOT=SUBSTR[,SUBSTR]",
@@ -604,9 +609,36 @@ def main() -> None:
 
     if not args.character:
         ap.error("--character, --bot or --list is required")
+    if args.kit and not args.kit_bot:
+        ap.error("--kit on a named --character needs --kit-bot <type> to say which table to roll")
 
     if args.dump_states:
         dump_states(args.character, args.grep)
+        return
+
+    if args.kit:
+        # A named character is a characters.json SPEC, not a rolled bot, so resolve it to a spec
+        # dict first and fold the kit into that - the builder consumes both shapes identically.
+        import kit_parts
+        reg = load_registry()
+        spec = dict(reg["characters"][args.character])
+        spec["id"] = args.character
+        spec.setdefault("clipSets", reg.get("clipSets") or {})
+        prefer = {}
+        for pf in args.prefer:
+            if "=" in pf:
+                k, v = pf.split("=", 1)
+                prefer[k.strip()] = [x.strip() for x in v.split(",") if x.strip()]
+        kit_report = kit_parts.apply(spec, args.kit_bot, args.seed, prefer=prefer or None,
+                                     skip_slots=set(args.skip_slot) or None)
+        out = build(character=spec, clip_set=args.clips, skip_clips=args.skip_clips,
+                    lods=args.lod, strict=not args.no_strict, out_dir=args.out)
+        import json as _json
+        _json.dump({"bot": args.kit_bot, "seed": args.seed,
+                    "slots": sorted({r[0] for r in kit_report if r[2] != "skip"}),
+                    "items": [{"slot": r[0], "item": r[1], "kind": r[2]}
+                              for r in kit_report if r[2] != "skip"]},
+                   open(os.path.join(out, "kit.json"), "w"), indent=1)
         return
 
     build(
