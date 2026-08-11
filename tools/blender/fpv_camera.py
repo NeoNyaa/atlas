@@ -52,6 +52,16 @@ AIRFRAMES = {
     # violent. overshoots, whips, and will lose the subject if the shot is not staged for it
     "racer":     dict(accel=30.0, max_speed=32.0, drag=1.1, aim_lag=0.22, bank=1.00, shake=0.35,
                       uptilt_deg="auto"),
+    # A TERMINAL DIVE, and the numbers are the real envelope rather than a dramatic guess. A 5"
+    # freestyle quad hits 100-130 km/h in a full-speed dive (28-36 m/s) and purpose-built race
+    # airframes reach 150-170 km/h; 34 m/s sits at the top of the freestyle band, which is what a
+    # cheap airframe pointed at the ground actually does. `accel` is what the CONTROLLER commands,
+    # not total thrust: a 5" pulls something like 8:1 static, but a diving quad is adding gravity to
+    # a partial-throttle vector, so ~2.6 g of commanded acceleration is the honest figure.
+    # Low aim_lag because a diving pilot is looking exactly where he is going; high shake because
+    # at 30 m/s near the ground the airframe is being thrown around by its own prop wash.
+    "strike":    dict(accel=26.0, max_speed=34.0, drag=1.05, aim_lag=0.18, bank=0.90, shake=0.30,
+                      uptilt_deg="auto"),
 }
 
 
@@ -172,6 +182,7 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
     v = np.zeros(3)
     pos = np.empty((F, 3))
     acc = np.empty((F, 3))
+    vel = np.zeros((F, 3))
 
     # Critically damped pursuit: the gains come from a chosen settle time rather than being dialled
     # by eye, so changing `accel` does not silently change the character of the motion.
@@ -202,6 +213,11 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
             p[2] = max(p[2], float(floor[f]))
         pos[f] = p
         acc[f] = a
+        # KEEP THE PER-FRAME VELOCITY. The orientation pass below needs frame 0's velocity, and
+        # reading the loop variable `v` after the loop has finished hands it the LAST frame's
+        # velocity instead - so frame 0 was oriented from the end of the flight and snapped to the
+        # correct heading on frame 1. That one-frame kink is visible in any moving shot.
+        vel[f] = v
 
     # ---- orientation: the airframe TILTS TO ACCELERATE ----
     # A quadrotor has exactly one force it can steer: thrust, along its own body-up.  So to produce
@@ -230,7 +246,7 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
     world_up = np.array([0.0, 0.0, 1.0])
     for f in range(F):
         to_sub = _unit(aim[f] - pos[f])
-        travel = _unit(v if f == 0 else pos[f] - pos[max(0, f - 1)], fallback=to_sub)
+        travel = _unit(vel[0] if f == 0 else pos[f] - pos[max(0, f - 1)], fallback=to_sub)
         yaw_dir = _unit(travel * lag + to_sub * (1.0 - lag), fallback=to_sub)
 
         # The thrust axis.  `bank` scales how much of the commanded acceleration the airframe is
