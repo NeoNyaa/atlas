@@ -210,10 +210,13 @@ MODES = {
 # less solid angle.
 #
 # Re-run the fit after ANY change to the backdrop's appearance. Adding the cloud layer alone moved
-# this by 2.37x, because cloud is much brighter than the clear sky it covers, and the horizon
-# handover moved it a further 1.20x. The fit solves an AFFINE model for that reason: HORIZON_HAZE
-# mixes toward a fixed scene-referred colour that does not scale with this constant.
-BACKDROP_RATIO = 0.149731
+# this by 2.37x and the horizon handover a further 1.20x. Note which way that first move went: the
+# ratio going UP means the backdrop got DARKER and needed more gain. That was the standing evidence
+# that the original absolute cloud palette was darker than the sky it covered, and it sat here
+# misread as "cloud is brighter than the sky" until the palette was measured directly.
+# The fit solves an AFFINE model, because HORIZON_HAZE mixes toward a fixed scene-referred colour
+# that does not scale with this constant.
+BACKDROP_RATIO = 0.114524
 
 # THE CLOUD LAYER, photoreal backdrop only. See _cloud_nodes for the ray-plane geometry.
 #
@@ -242,9 +245,21 @@ CLOUD_RELIEF_STEP = 0.075   # layer-units the second noise sample is offset towa
 CLOUD_RELIEF_GAIN = 0.070   # the relief difference that maps to fully lit
 # A cloud top is BRIGHTER than the sky behind it and its base is much darker; that spread is the
 # whole reason a deck reads as three-dimensional rather than as fog on glass.
-CLOUD_SHADOW = (0.230, 0.248, 0.280)   # the underside; blue-grey, because it is lit by sky
-CLOUD_LIT = (0.960, 0.968, 0.985)      # the sun-facing face
-CLOUD_SILVER = (1.320, 1.300, 1.240)   # the rim near the disc; above 1.0 on purpose, for the grade
+#
+# THESE ARE MULTIPLES OF THE LOCAL SKY'S LUMINANCE, not absolute radiances, and that is a bug fix
+# rather than a style. Absolute constants here were all darker than the darkest pixel of the raw sky
+# they were composited over (see _cloud_nodes), which made the whole deck a silhouette. Expressed as
+# a ratio the numbers also stop depending on SKY_STRENGTH, BACKDROP_RATIO or the sky model's own
+# scale, so none of them can silently invert this again.
+CLOUD_GAIN_SHADOW = 0.30    # a base seen from below is much darker than the sky beside it
+CLOUD_GAIN_LIT = 1.05       # a sun-facing face is a little brighter
+CLOUD_GAIN_SILVER = 1.45    # the rim near the disc is clearly brighter
+# Chromaticity is authored, because it is the one thing luminance cannot carry: a base is lit by the
+# SKY and is cool, a sun-facing face is lit by the SUN and is warm. Multiplying by the sky's colour
+# instead of its luminance would erase exactly this difference.
+CLOUD_TINT_SHADOW = (0.90, 0.96, 1.12)
+CLOUD_TINT_LIT = (1.03, 1.00, 0.96)
+CLOUD_TINT_SILVER = (1.03, 1.00, 0.96)
 CLOUD_SILVER_ARC = (0.72, 0.995)       # dot(view, sun) over which the silver lining ramps in
 
 # Where the backdrop hands over to the scene's own aerial perspective, as ray.z. At or below the
@@ -735,11 +750,49 @@ def _cloud_nodes(nt, sun_dir, sky_col, x0=-1500, y0=-620):
     nt.links.new(w_rel.outputs[0], body_fac.inputs[0])
     nt.links.new(w_den.outputs[0], body_fac.inputs[1])
 
+    # THE PALETTE IS RELATIVE TO THE SKY IT COVERS, not absolute. This is the correction to a real
+    # bug: the first version mixed absolute constants (shadow 0.246, lit 0.968, silver 1.300 in
+    # luminance) into RAW ShaderNodeTexSky radiance, whose upper hemisphere runs min 2.323, median
+    # 3.596, max 18.9. Every one of those tones was darker than the DARKEST sky pixel that exists,
+    # so the deck could only ever be a silhouette and the silver lining was the dimmest part of it.
+    # Every bright region in those frames was sky showing through, not lit cloud.
+    #
+    # The tell was already in the fit and went unread: adding the cloud layer moved BACKDROP_RATIO
+    # UP by 2.37x, i.e. the backdrop needed MORE gain, i.e. the clouds made it DARKER.
+    #
+    # So each tone is now the local sky's LUMINANCE times a gain times an authored chromaticity.
+    # Luminance, deliberately, and never the sky's colour: multiplying by the colour would make
+    # every tone inherit the sky's blue, collapse deck and sky into one hue family, and destroy the
+    # warm-key/cool-base separation that is most of what reads as cloud. A base is lit by SKY and is
+    # cool; a sun-facing face is lit by the SUN and is warm.
+    skylum = nt.nodes.new("ShaderNodeVectorMath"); skylum.location = (x0 + 1260, y0 + 560)
+    skylum.operation = 'DOT_PRODUCT'
+    # `sky_col` is the function's argument, the RAW sky. It must stay that: reading the cloud
+    # composite here instead would wire `over` back into its own input, which links.new builds
+    # happily and Cycles then reports as a dependency cycle.
+    nt.links.new(sky_col, skylum.inputs[0])
+    skylum.inputs[1].default_value = (0.2126, 0.7152, 0.0722)
+
+    def _tone(gain, tint, loc):
+        g = nt.nodes.new("ShaderNodeMath"); g.location = loc
+        g.operation = 'MULTIPLY'
+        nt.links.new(skylum.outputs["Value"], g.inputs[0])
+        g.inputs[1].default_value = gain
+        c = nt.nodes.new("ShaderNodeVectorMath"); c.location = (loc[0] + 170, loc[1])
+        c.operation = 'SCALE'
+        c.inputs[0].default_value = tuple(tint)
+        nt.links.new(g.outputs[0], _sock(c, "Scale", 3))
+        return c.outputs["Vector"]
+
+    t_shadow = _tone(CLOUD_GAIN_SHADOW, CLOUD_TINT_SHADOW, (x0 + 1450, y0 + 700))
+    t_lit = _tone(CLOUD_GAIN_LIT, CLOUD_TINT_LIT, (x0 + 1450, y0 + 620))
+    t_silver = _tone(CLOUD_GAIN_SILVER, CLOUD_TINT_SILVER, (x0 + 1450, y0 + 540))
+
     body = nt.nodes.new("ShaderNodeMix"); body.location = (x0 + 2180, y0 + 260)
     body.data_type = 'RGBA'
     nt.links.new(body_fac.outputs[0], _sock(body, "Factor", 0))
-    _sock(body, "A", 6).default_value = tuple(CLOUD_SHADOW) + (1.0,)
-    _sock(body, "B", 7).default_value = tuple(CLOUD_LIT) + (1.0,)
+    nt.links.new(t_shadow, _sock(body, "A", 6))
+    nt.links.new(t_lit, _sock(body, "B", 7))
 
     # SILVER LINING near the sun, which is where a real cloud deck is brightest and thinnest.
     dot = nt.nodes.new("ShaderNodeVectorMath"); dot.location = (x0 + 1260, y0 - 420)
@@ -758,7 +811,7 @@ def _cloud_nodes(nt, sun_dir, sky_col, x0=-1500, y0=-620):
     hot.data_type = 'RGBA'
     nt.links.new(silver.outputs["Result"], _sock(hot, "Factor", 0))
     nt.links.new(body.outputs[2], _sock(hot, "A", 6))
-    _sock(hot, "B", 7).default_value = tuple(CLOUD_SILVER) + (1.0,)
+    nt.links.new(t_silver, _sock(hot, "B", 7))
 
     # Composite over the sky. Clouds are OPAQUE where they are thick, so this is a plain mix.
     over = nt.nodes.new("ShaderNodeMix"); over.location = (x0 + 2360, y0)

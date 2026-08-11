@@ -471,6 +471,32 @@ Bright cloud reading near white in the top percentile is what bright cloud does 
 the measurement says the energy match is already the better exposure and a hand-tuned offset would
 be making it worse on purpose.
 
+**The cloud palette must be RELATIVE to the sky, and getting this wrong made the whole deck a
+silhouette.** The first implementation mixed absolute constants into raw `ShaderNodeTexSky`
+radiance. Measured over the upper hemisphere that raw sky runs **min 2.323, median 3.596, max
+18.9**, while the palette's luminances were shadow **0.246**, lit **0.968**, silver **1.300**. Every
+tone was darker than the *darkest sky pixel that exists* - 0.11x, 0.42x and 0.56x of the minimum -
+so cloud could only ever read as a stain, its internal modelling sat in AgX's toe, and the "silver
+lining" was the dimmest part of the deck. Every bright region in those frames was sky showing
+through, not lit cloud, which is why tuning the tone model kept not behaving as predicted.
+
+The evidence was already sitting in the fit and was misread: adding the cloud layer moved
+`BACKDROP_RATIO` **up** 2.37x. Up means the backdrop needed *more* gain, which means the clouds made
+it **darker**. That was recorded in a comment claiming the opposite.
+
+Each tone is now the local sky's **luminance** times a gain times an authored chromaticity:
+`CLOUD_GAIN_SHADOW 0.30`, `_LIT 1.05`, `_SILVER 1.45`. Luminance and never the sky's colour -
+multiplying by the colour makes every tone inherit the sky's blue, collapses deck and sky into one
+hue family, and erases the warm-key/cool-base separation that is most of what reads as cloud (a base
+is lit by the SKY and is cool; a sun-facing face is lit by the SUN and is warm). As ratios the
+numbers also no longer depend on `SKY_STRENGTH`, `BACKDROP_RATIO` or the sky model's own scale, so
+none of those can silently invert it again. The rebase raised the hemisphere mean 28.3% and moved
+pixels above linear 1.0 from 37.2% to 65.1%, i.e. toward the capture's 82.7% rather than away.
+
+One implementation trap: the luminance dot product must read the *raw* sky argument. Reading the
+cloud composite instead wires the mix back into its own input, which `links.new` builds happily and
+Cycles then reports as a dependency cycle.
+
 **The solar disc was tried again on the new footing, and rejected on a new measurement.** The old
 objection (+37% seed-to-seed noise) is about a disc in the ENVIRONMENT, where Cycles
 importance-samples it as a light; behind `Is Camera Ray` nothing terminates on it, so that objection
