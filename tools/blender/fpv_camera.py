@@ -42,16 +42,29 @@ DEFAULT_LENS_MM = 15.0
 #: Airframe presets.  `accel` is m/s^2 available to the controller, `max_speed` m/s, `drag` per
 #: second.  A 5" freestyle quad really does pull ~2 g and cruise at 20 m/s, which is why the chase
 #: reads as fast even when the subject is only doing 5.
+#: Every airframe also carries how it POINTS, not just how it moves, because those are as much a
+#: property of the machine and its pilot as thrust is:
+#:   yaw_rate_deg   deg/s    yaw authority the pilot actually uses while tracking a subject
+#:   tilt_rate_deg  deg/s    slew rate of the pitch gimbal
+#:   wander_hz      Hz       the pilot's own low-frequency correction, NOT airframe vibration
+#:   wander_deg     deg      amplitude of that wander, before the per-airframe `shake` scale
+#:   smooth_s       s        time constant the stick input is filtered over
+#: These used to be constants inside `fly` with one value for every airframe and a filter window
+#: fixed at 7 taps regardless of frame rate - which silently changed the time constant whenever fps
+#: did. Expressed in seconds and Hz they mean the same thing at any frame rate.
 AIRFRAMES = {
     # heavy, smooth, for long approaches - closest to a cinelifter
     "cine":      dict(accel=12.0, max_speed=14.0, drag=1.2, aim_lag=0.55, bank=0.55, shake=0.10,
-                      uptilt_deg="auto"),
+                      uptilt_deg="auto", yaw_rate_deg=120.0, tilt_rate_deg=90.0,
+                      wander_hz=0.40, wander_deg=1.2, smooth_s=0.30),
     # the default: quick, banks hard, still readable
     "freestyle": dict(accel=18.0, max_speed=22.0, drag=1.3, aim_lag=0.35, bank=0.85, shake=0.22,
-                      uptilt_deg="auto"),
+                      uptilt_deg="auto", yaw_rate_deg=240.0, tilt_rate_deg=150.0,
+                      wander_hz=0.55, wander_deg=1.6, smooth_s=0.22),
     # violent. overshoots, whips, and will lose the subject if the shot is not staged for it
     "racer":     dict(accel=30.0, max_speed=32.0, drag=1.1, aim_lag=0.22, bank=1.00, shake=0.35,
-                      uptilt_deg="auto"),
+                      uptilt_deg="auto", yaw_rate_deg=360.0, tilt_rate_deg=220.0,
+                      wander_hz=0.75, wander_deg=2.0, smooth_s=0.16),
     # A TERMINAL DIVE, and the numbers are the real envelope rather than a dramatic guess. A 5"
     # freestyle quad hits 100-130 km/h in a full-speed dive (28-36 m/s) and purpose-built race
     # airframes reach 150-170 km/h; 34 m/s sits at the top of the freestyle band, which is what a
@@ -74,7 +87,8 @@ AIRFRAMES = {
     # with bank 0.90 and still 124 deg at 0.40. 0.22 keeps 7.5 m/s^2 of attitude against 9.81 of
     # gravity, which banks visibly and never flips.
     "strike":    dict(accel=34.0, max_speed=34.0, drag=0.95, aim_lag=0.10, bank=0.22, shake=0.25,
-                      uptilt_deg="auto"),
+                      uptilt_deg="auto", yaw_rate_deg=200.0, tilt_rate_deg=130.0,
+                      wander_hz=0.45, wander_deg=1.1, smooth_s=0.26),
 }
 
 
@@ -149,6 +163,33 @@ def _unit(v, fallback=(0.0, 1.0, 0.0)):
     if n < 1e-9:
         return np.asarray(fallback, dtype=np.float64)
     return v / n
+
+
+def _lowpass_kernel(smooth_s, fps):
+    """A normalised Gaussian whose width is a TIME, not a tap count.
+
+    The first version of this was a fixed seven-tap binomial, which means a 0.23 s window at 30 fps
+    and 0.12 s at 60 - the same code smoothing twice as hard at one frame rate as the other. Given
+    a time constant the kernel is rebuilt for whatever fps is in use and the motion is identical.
+    """
+    sigma = max(1e-3, float(smooth_s) * float(fps) * 0.5)
+    half = max(1, int(math.ceil(3.0 * sigma)))
+    x = np.arange(-half, half + 1, dtype=np.float64)
+    k = np.exp(-0.5 * (x / sigma) ** 2)
+    return k / k.sum()
+
+
+def _smooth_axis(v, k):
+    """Apply `k` along axis 0, holding the end values rather than fading toward zero."""
+    pad = len(k) // 2
+    if v.ndim == 1:
+        p = np.concatenate([np.repeat(v[:1], pad), v, np.repeat(v[-1:], pad)])
+        return np.convolve(p, k, mode="valid")
+    p = np.vstack([np.repeat(v[:1], pad, axis=0), v, np.repeat(v[-1:], pad, axis=0)])
+    out = np.empty_like(v)
+    for c in range(v.shape[1]):
+        out[:, c] = np.convolve(p[:, c], k, mode="valid")
+    return out
 
 
 def _smooth_noise(n, rng, octaves=2, base=0.55, fps=30.0):
@@ -278,8 +319,10 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
     tilt_lo = math.radians(float(cfg.get("tilt_min_deg", -55.0)))
     tilt_hi = math.radians(float(cfg.get("tilt_max_deg", 45.0)))
     bank_gain = float(cfg["bank"])
-    yaw_shake = _smooth_noise(F, rng, fps=fps) * math.radians(1.6) * cfg["shake"]
-    pitch_shake = _smooth_noise(F, rng, fps=fps) * math.radians(1.2) * cfg["shake"]
+    wander_hz = float(cfg.get("wander_hz", 0.55))
+    wander = math.radians(float(cfg.get("wander_deg", 1.6))) * float(cfg["shake"])
+    yaw_shake = _smooth_noise(F, rng, base=wander_hz, fps=fps) * wander
+    pitch_shake = _smooth_noise(F, rng, base=wander_hz, fps=fps) * wander * 0.75
     world_up = np.array([0.0, 0.0, 1.0])
 
     # SMOOTH THE INTENT BEFORE FLYING IT. `yaw_dir` blends travel direction with direction-to-
@@ -294,27 +337,22 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
         _to = _unit(_aim[f] - pos[f])
         _tr = _unit(vel[0] if f == 0 else pos[f] - pos[max(0, f - 1)], fallback=_to)
         raw_dir[f] = _unit(_tr * lag + _to * (1.0 - lag), fallback=_to)
-    _k = np.array([1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0])
-    _k /= _k.sum()
+    _k = _lowpass_kernel(cfg.get("smooth_s", 0.22), fps)
     _pad = len(_k) // 2
-    _p = np.vstack([np.repeat(raw_dir[:1], _pad, axis=0), raw_dir,
-                    np.repeat(raw_dir[-1:], _pad, axis=0)])
-    smooth_dir = np.empty_like(raw_dir)
-    for c in range(3):
-        smooth_dir[:, c] = np.convolve(_p[:, c], _k, mode="valid")
+    smooth_dir = _smooth_axis(raw_dir, _k)
     for f in range(F):
         smooth_dir[f] = _unit(smooth_dir[f], fallback=raw_dir[f])
 
     # Yaw authority. A 5" quad will spin far faster than this, but a CAMERA that does is unwatchable
     # and it is not what the footage shows; this is the rate a pilot actually yaws while tracking.
-    max_yaw_step = math.radians(float(cfg.get("yaw_rate_deg", 240.0))) / float(fps)
+    max_yaw_step = math.radians(float(cfg["yaw_rate_deg"])) / float(fps)
     prev_fwd = None
     prev_tilt = None
     B_UP = np.empty((F, 3))
     B_FWD = np.empty((F, 3))
     B_RIGHT = np.empty((F, 3))
     T_ANG = np.zeros(F)
-    max_tilt_step = math.radians(float(cfg.get("tilt_rate_deg", 150.0))) / float(fps)
+    max_tilt_step = math.radians(float(cfg["tilt_rate_deg"])) / float(fps)
     for f in range(F):
         to_sub = _unit(aim[f] - pos[f])
         yaw_dir = smooth_dir[f]
@@ -390,8 +428,7 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
     # cap, with 48.9% of the dive's angular energy above 3 Hz even after yaw was fixed. A limiter
     # cannot smooth that; it IS what is being saturated. Filtering the demand can.
     if auto_tilt and F > 3:
-        _t = np.concatenate([np.repeat(T_ANG[:1], _pad), T_ANG, np.repeat(T_ANG[-1:], _pad)])
-        T_ANG = np.convolve(_t, _k, mode="valid")
+        T_ANG = _smooth_axis(T_ANG, _k)
 
     for f in range(F):
         body_up, b_fwd, b_right = B_UP[f], B_FWD[f], B_RIGHT[f]
