@@ -274,6 +274,12 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
     yaw_shake = _smooth_noise(F, rng, fps=fps) * math.radians(1.6) * cfg["shake"]
     pitch_shake = _smooth_noise(F, rng, fps=fps) * math.radians(1.2) * cfg["shake"]
     world_up = np.array([0.0, 0.0, 1.0])
+    # Yaw authority. A 5" quad will spin far faster than this, but a CAMERA that does is unwatchable
+    # and it is not what the footage shows; this is the rate a pilot actually yaws while tracking.
+    max_yaw_step = math.radians(float(cfg.get("yaw_rate_deg", 240.0))) / float(fps)
+    prev_fwd = None
+    prev_tilt = None
+    max_tilt_step = math.radians(float(cfg.get("tilt_rate_deg", 150.0))) / float(fps)
     for f in range(F):
         to_sub = _unit(aim[f] - pos[f])
         travel = _unit(vel[0] if f == 0 else pos[f] - pos[max(0, f - 1)], fallback=to_sub)
@@ -285,9 +291,34 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
         body_up = _unit(acc[f] * bank_gain + world_up * G, fallback=world_up)
 
         # Body forward is the yaw intent projected into the plane the thrust axis defines.
-        b_fwd = _unit(yaw_dir - body_up * float(yaw_dir @ body_up),
-                      fallback=_unit(np.cross(body_up, np.cross(to_sub, body_up)),
-                                     fallback=(0.0, 1.0, 0.0)))
+        # YAW HAS A RATE LIMIT, and without one this line mirrors. `b_fwd` is the yaw intent
+        # projected into the plane the thrust axis defines, and in a dive - nose down, nearly over
+        # the target - that horizontal component collapses toward zero. Its DIRECTION is then
+        # numerically unstable, so consecutive frames can land on opposite sides and the camera
+        # snaps from +45 to -45 degrees in a single frame. A quad cannot do that: yaw is a real
+        # axis with real authority, a few hundred degrees per second, and 90 degrees in 1/30 s
+        # would be 2700.
+        raw = yaw_dir - body_up * float(yaw_dir @ body_up)
+        if np.linalg.norm(raw) < 1e-3 and prev_fwd is not None:
+            # Degenerate: hold the heading rather than inventing one from a fallback constant.
+            raw = prev_fwd - body_up * float(prev_fwd @ body_up)
+        b_fwd = _unit(raw, fallback=_unit(np.cross(body_up, np.cross(to_sub, body_up)),
+                                          fallback=(0.0, 1.0, 0.0)))
+        if prev_fwd is not None:
+            # Clamp the frame-to-frame turn about the thrust axis to what the airframe can yaw.
+            p_flat = _unit(prev_fwd - body_up * float(prev_fwd @ body_up), fallback=b_fwd)
+            c = float(np.clip(p_flat @ b_fwd, -1.0, 1.0))
+            ang = math.acos(c)
+            if ang > max_yaw_step:
+                axis = np.cross(p_flat, b_fwd)
+                n = np.linalg.norm(axis)
+                if n > 1e-9:
+                    axis = axis / n
+                    k, th = axis, max_yaw_step
+                    b_fwd = _unit(p_flat * math.cos(th)
+                                  + np.cross(k, p_flat) * math.sin(th)
+                                  + k * float(k @ p_flat) * (1.0 - math.cos(th)))
+        prev_fwd = b_fwd.copy()
         b_right = _unit(np.cross(b_fwd, body_up), fallback=(1.0, 0.0, 0.0))
 
         # CAMERA TILT.  A bolted-on FPV cam carries 20-40 deg of uptilt because the airframe has to
@@ -306,6 +337,12 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
             want_dir = _unit(aim[f] - pos[f], fallback=b_fwd)
             t_ang = math.atan2(float(want_dir @ body_up), float(want_dir @ b_fwd))
             t_ang = max(tilt_lo, min(tilt_hi, t_ang))
+            # The gimbal has a slew rate too. Solving the tilt per frame with nothing limiting it
+            # lets the lens pitch as fast as the geometry demands, which in a dive is most of the
+            # residual single-frame swing once yaw is clamped.
+            if prev_tilt is not None:
+                t_ang = prev_tilt + max(-max_tilt_step, min(max_tilt_step, t_ang - prev_tilt))
+            prev_tilt = t_ang
         else:
             t_ang = tilt
         ct, st = math.cos(t_ang), math.sin(t_ang)
