@@ -60,7 +60,20 @@ AIRFRAMES = {
     # a partial-throttle vector, so ~2.6 g of commanded acceleration is the honest figure.
     # Low aim_lag because a diving pilot is looking exactly where he is going; high shake because
     # at 30 m/s near the ground the airframe is being thrown around by its own prop wash.
-    "strike":    dict(accel=26.0, max_speed=34.0, drag=1.05, aim_lag=0.18, bank=0.90, shake=0.30,
+    # `drag` sets the real terminal, not `max_speed`: the integrator bleeds `drag * v` every second,
+    # so a quad settles near accel/drag. At accel 26 and drag 1.05 that is 24.8 m/s (89 km/h) and the
+    # 34 cap never bound - the airframe simply could not reach the dive speed it was labelled with.
+    # accel 34 with drag 0.95 puts the terminal at the cap, i.e. inside the measured 100-130 km/h.
+    # `bank` is low on purpose. It is the fraction of commanded acceleration the airframe expresses
+    # as attitude, and at 0.90 with 34 m/s^2 of command the thrust axis passes the horizon and the
+    # camera rolls through 163 degrees - a real quad does pitch past vertical in a dive, but the
+    # footage does not, because the pilot is not commanding all of it as attitude.
+    # `bank` must satisfy bank * accel < G or the thrust axis inverts. The airframe points body-up
+    # along (acc * bank + G), so at accel 34 anything above 0.29 can drive the vertical term
+    # negative on a steep command and the camera rolls through the horizon - measured at 163 deg
+    # with bank 0.90 and still 124 deg at 0.40. 0.22 keeps 7.5 m/s^2 of attitude against 9.81 of
+    # gravity, which banks visibly and never flips.
+    "strike":    dict(accel=34.0, max_speed=34.0, drag=0.95, aim_lag=0.10, bank=0.22, shake=0.25,
                       uptilt_deg="auto"),
 }
 
@@ -138,19 +151,36 @@ def _unit(v, fallback=(0.0, 1.0, 0.0)):
     return v / n
 
 
-def _smooth_noise(n, rng, octaves=3, base=6.0, fps=30.0):
+def _smooth_noise(n, rng, octaves=3, base=1.6, fps=30.0):
     """Band-limited wobble: a few sine octaves with random phase.
 
     White noise per frame would be denoised away by the renderer's own temporal filtering and reads
     as sensor grain rather than airframe vibration; a quad's frame buzz is a handful of tones.
+
+    THE BAND LIMIT IS THE WHOLE POINT AND IT USED TO BE MISSING. At base 6.0 the octaves landed on
+    6, 12 and 24 Hz. Nyquist at 30 fps is 15, so the top octave aliased outright, and 12 Hz is a
+    2.5-frame period - which is not vibration on screen, it is the camera changing direction every
+    other frame. Measured on a chase, 90.3% of the flight's angular energy sat above 5 Hz: the
+    footage was almost entirely buzz with a move hidden underneath it.
+
+    A real quad's frame buzz IS up at 60-200 Hz, but none of that survives a 30 fps sample - a
+    camera integrates it into motion blur, it does not step through it. What belongs at this frame
+    rate is the slow wander of a pilot holding a line, so the base drops to 1.6 Hz and any octave
+    that would land above `fps * 0.28` (a period under ~3.5 frames) is dropped rather than aliased.
     """
     t = np.arange(n) / float(fps)
     out = np.zeros(n)
     amp = 1.0
+    used = 0
     for k in range(octaves):
         f = base * (2 ** k)
+        if f > fps * 0.28:
+            break
         out += amp * np.sin(2 * np.pi * f * t + rng.uniform(0, 2 * np.pi))
         amp *= 0.5
+        used += 1
+    if used == 0:
+        return np.zeros(n)
     return out / max(1e-9, np.abs(out).max())
 
 
