@@ -220,6 +220,11 @@ fn spawn_npcs(
             return (!t.is_empty()).then(|| t.to_ascii_lowercase());
         }
         // Bare ids: only ones that are not the base/pmc/utility packs act as boss tokens.
+        // `assault_3` is a rolled SCAV, not a boss called "assault_3"; without this the pool ids
+        // become boss tokens and match any way whose name happens to contain them.
+        if stem.starts_with("assault") {
+            return None;
+        }
         (!matches!(stem, "scav" | "assault" | "player" | "pmcbear" | "pmcusec" | "pmc_bear" | "pmc_usec"))
             .then(|| stem.to_ascii_lowercase())
     };
@@ -261,6 +266,36 @@ fn spawn_npcs(
         })
         .and_then(|d| crate::character::weapon::load(&d, &mut meshes, &mut materials, &mut images));
 
+    // A CAST OF ONE LOOKS LIKE A CAST OF ONE. Every non-boss agent used to take pack 0, so a map
+    // with 24 scavs showed the same man 24 times - same face, same coat, same kit, because all of
+    // that is baked into a pack at build time and cannot vary per entity.
+    //
+    // `assault` is the scav bot type, and `build_character.py --bot assault --seed N` rolls BOTH
+    // the appearance (body/feet/hands/head, from the game's own weighted tables) and the kit. So a
+    // pool of `assault_<n>` packs is a cast of different men, and each agent takes one by index.
+    // Falls back to the base pack when none are built, which is the old behaviour exactly.
+    let mut scav_pool: Vec<usize> = Vec::new();
+    {
+        let mut ids: Vec<&String> = available
+            .iter()
+            .filter(|id| {
+                id.strip_prefix("assault_")
+                    .is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+            })
+            .collect();
+        ids.sort();
+        for id in ids {
+            if let Some(i) = ensure_pack(id, &mut packs, &mut pack_ids) {
+                scav_pool.push(i);
+            }
+        }
+    }
+    if scav_pool.is_empty() {
+        scav_pool.push(0);
+    }
+
+    // Separate from `n`, which the spawn closure borrows mutably.
+    let mut cast_seq = 0usize;
     let mut n = 0usize;
     let mut spawn_agent = |targets: Vec<Vec3>, ping_pong: bool, cast: usize,
                            packs: &Vec<Arc<CharacterPack>>,
@@ -311,6 +346,10 @@ fn spawn_npcs(
                 break;
             }
         }
+        if cast == 0 {
+            cast = scav_pool[cast_seq % scav_pool.len()];
+            cast_seq += 1;
+        }
         spawn_agent(route.points.clone(), true, cast, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
     }
     // One wanderer per core group with enough points to circulate; capped so big maps stay light.
@@ -318,7 +357,9 @@ fn spawn_npcs(
     let mut wanderers = 0usize;
     for pts in groups {
         if pts.len() >= 3 && wanderers < MAX_WANDERERS {
-            spawn_agent(pts, false, 0, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
+            let cast = scav_pool[cast_seq % scav_pool.len()];
+            cast_seq += 1;
+            spawn_agent(pts, false, cast, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
             wanderers += 1;
         }
     }
