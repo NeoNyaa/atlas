@@ -151,7 +151,7 @@ def _unit(v, fallback=(0.0, 1.0, 0.0)):
     return v / n
 
 
-def _smooth_noise(n, rng, octaves=3, base=1.6, fps=30.0):
+def _smooth_noise(n, rng, octaves=2, base=0.55, fps=30.0):
     """Band-limited wobble: a few sine octaves with random phase.
 
     White noise per frame would be denoised away by the renderer's own temporal filtering and reads
@@ -165,8 +165,15 @@ def _smooth_noise(n, rng, octaves=3, base=1.6, fps=30.0):
 
     A real quad's frame buzz IS up at 60-200 Hz, but none of that survives a 30 fps sample - a
     camera integrates it into motion blur, it does not step through it. What belongs at this frame
-    rate is the slow wander of a pilot holding a line, so the base drops to 1.6 Hz and any octave
-    that would land above `fps * 0.28` (a period under ~3.5 frames) is dropped rather than aliased.
+    rate is the slow wander of a pilot holding a line, and any octave above `fps * 0.28` (a period
+    under ~3.5 frames) is dropped rather than aliased.
+
+    THE BASE IS 0.55 Hz, AND THAT IS A MEASURED CHOICE. A sine reverses twice per cycle, so 1.6 Hz
+    hands the camera 3.2 direction changes a second - and an audit of the solved flights measured
+    exactly that: 2.98 reversals/s on the dive, 3.21 on recon, with half to three quarters of all
+    angular energy above 3 Hz. The rates were tiny, a handful of degrees per second, so it never
+    read as violence; it read as the camera shaking its head. A rate limit cannot fix that, because
+    it bounds magnitude and says nothing about sign changes. Slowing the wander does.
     """
     t = np.arange(n) / float(fps)
     out = np.zeros(n)
@@ -274,16 +281,43 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
     yaw_shake = _smooth_noise(F, rng, fps=fps) * math.radians(1.6) * cfg["shake"]
     pitch_shake = _smooth_noise(F, rng, fps=fps) * math.radians(1.2) * cfg["shake"]
     world_up = np.array([0.0, 0.0, 1.0])
+
+    # SMOOTH THE INTENT BEFORE FLYING IT. `yaw_dir` blends travel direction with direction-to-
+    # subject, and both are differences of noisy positions, so the raw blend dithers frame to frame
+    # and the airframe faithfully chases the dither. A pilot's stick input is not a per-frame
+    # decision; filtering the intent is closer to what a human does than any amount of clamping
+    # applied afterwards. Binomial kernel, normalised, applied to the VECTORS so there is no angle
+    # wrap to get wrong.
+    _aim = np.asarray(aim, dtype=np.float64)
+    raw_dir = np.empty((F, 3))
+    for f in range(F):
+        _to = _unit(_aim[f] - pos[f])
+        _tr = _unit(vel[0] if f == 0 else pos[f] - pos[max(0, f - 1)], fallback=_to)
+        raw_dir[f] = _unit(_tr * lag + _to * (1.0 - lag), fallback=_to)
+    _k = np.array([1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0])
+    _k /= _k.sum()
+    _pad = len(_k) // 2
+    _p = np.vstack([np.repeat(raw_dir[:1], _pad, axis=0), raw_dir,
+                    np.repeat(raw_dir[-1:], _pad, axis=0)])
+    smooth_dir = np.empty_like(raw_dir)
+    for c in range(3):
+        smooth_dir[:, c] = np.convolve(_p[:, c], _k, mode="valid")
+    for f in range(F):
+        smooth_dir[f] = _unit(smooth_dir[f], fallback=raw_dir[f])
+
     # Yaw authority. A 5" quad will spin far faster than this, but a CAMERA that does is unwatchable
     # and it is not what the footage shows; this is the rate a pilot actually yaws while tracking.
     max_yaw_step = math.radians(float(cfg.get("yaw_rate_deg", 240.0))) / float(fps)
     prev_fwd = None
     prev_tilt = None
+    B_UP = np.empty((F, 3))
+    B_FWD = np.empty((F, 3))
+    B_RIGHT = np.empty((F, 3))
+    T_ANG = np.zeros(F)
     max_tilt_step = math.radians(float(cfg.get("tilt_rate_deg", 150.0))) / float(fps)
     for f in range(F):
         to_sub = _unit(aim[f] - pos[f])
-        travel = _unit(vel[0] if f == 0 else pos[f] - pos[max(0, f - 1)], fallback=to_sub)
-        yaw_dir = _unit(travel * lag + to_sub * (1.0 - lag), fallback=to_sub)
+        yaw_dir = smooth_dir[f]
 
         # The thrust axis.  `bank` scales how much of the commanded acceleration the airframe is
         # allowed to express as attitude: 1.0 is the honest quadrotor, less is a heavier frame that
@@ -345,7 +379,23 @@ def fly(subject, want, fps=30, airframe="freestyle", start=None, seed=0, lens_mm
             prev_tilt = t_ang
         else:
             t_ang = tilt
-        ct, st = math.cos(t_ang), math.sin(t_ang)
+        B_UP[f] = body_up
+        B_FWD[f] = b_fwd
+        B_RIGHT[f] = b_right
+        T_ANG[f] = t_ang
+
+    # SMOOTH THE GIMBAL, for the same reason the yaw intent is smoothed. The tilt is solved per
+    # frame from the geometry, and in a dive the subject sweeps down the frame fast enough that the
+    # demand saturates the slew limit and then catches up - measured at 151.7 deg/s against a 150
+    # cap, with 48.9% of the dive's angular energy above 3 Hz even after yaw was fixed. A limiter
+    # cannot smooth that; it IS what is being saturated. Filtering the demand can.
+    if auto_tilt and F > 3:
+        _t = np.concatenate([np.repeat(T_ANG[:1], _pad), T_ANG, np.repeat(T_ANG[-1:], _pad)])
+        T_ANG = np.convolve(_t, _k, mode="valid")
+
+    for f in range(F):
+        body_up, b_fwd, b_right = B_UP[f], B_FWD[f], B_RIGHT[f]
+        ct, st = math.cos(T_ANG[f]), math.sin(T_ANG[f])
         d = _unit(b_fwd * ct + body_up * st)
         u = _unit(body_up * ct - b_fwd * st)
 
