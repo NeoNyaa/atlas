@@ -461,7 +461,7 @@ pub fn navigate_tab(
                             RichText::new("PLAN LOOT RUN").size(theme::SIZE_LABEL).strong()
                                 .color(if can_plan { theme::ACCENT } else { theme::FAINT }))
                             .min_size(full).corner_radius(0.0))
-                        .on_hover_text("pick the highest-value loot tour that fits the budget, ending at an extract \u{00B7} honors the avoid options")
+                        .on_hover_text("pick the highest-value loot tour that fits the budget, ending at an extract \u{00B7} honors the avoid options and skips loot behind doors you have no key for (tick your keys under Layers)")
                         .on_disabled_hover_text(if !ready {
                             "routing has not been built for this map"
                         } else if active_n == 0 {

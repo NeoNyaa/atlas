@@ -412,6 +412,10 @@ fn dispatch_route(
     >,
     // PatrolWay polylines (the game's own PatrolPoint transforms) for the "avoid combat" field.
     zones: Res<crate::poi::GameDataZones>,
+    // Lock / door markers (both carry LockKeys) + which keys the player has ticked in the Layers
+    // tab: a keyed door whose key is NOT owned is sealed for routing, same as for the loot plan.
+    locks: Query<(&GlobalTransform, &crate::poi::LockKeys)>,
+    progress: Res<crate::progress::PlayerProgress>,
     mut task: ResMut<PathfindTask>,
     mut result: ResMut<RouteResult>,
 ) {
@@ -469,6 +473,16 @@ fn dispatch_route(
     } else {
         (Vec::new(), Vec::new())
     };
+    // Locked doors the player has no key for: hard-block the doorway (BLOCK_COST) so no variant
+    // routes through it. Owning the key (ticked in the Layers tab) leaves it passable as before.
+    // 1.6 m half-width matches the loot planner and the bake's DOOR_STAMP_R.
+    let block_pts: Vec<(Vec3, f32)> = locks
+        .iter()
+        .filter(|(_, keys)| {
+            !keys.0.is_empty() && !keys.0.iter().any(|key| progress.owns_key(key))
+        })
+        .map(|(gt, _)| (gt.translation(), 1.6_f32))
+        .collect();
     let dests = req.dests.clone();
     let labels = req.labels.clone();
     let optimize = req.optimize_order;
@@ -480,6 +494,10 @@ fn dispatch_route(
     // Route on a compute-pool thread — off the render loop; dropping the old task drops its result.
     let t = AsyncComputeTaskPool::get().spawn(async move {
         let mut s = crate::nav::pooled_scratch(grid.nodes());
+        // Hard-block field for un-keyed locked doors. Used as the BASE avoid for every variant
+        // (Direct included) so the whole route family respects a door the player cannot open.
+        let block: Option<crate::nav::AvoidMap> =
+            (!block_pts.is_empty()).then(|| grid.build_block(&block_pts));
         let lbl = |i: usize| labels.get(i).cloned();
         // One variant under a given avoid field. Multi-stop queries (chain/tour) stay single-plan;
         // a single destination gets the full Direct/Cautious/Wide-berth comparison.
@@ -519,12 +537,14 @@ fn dispatch_route(
         let mut trace: Vec<(Vec3, f32)> = Vec::new();
         if visualize {
             // Instrumented A*: same result as run(), plus the recorded flood for the live viz.
-            if let Some((pts, dist, tr)) = grid.path_traced(start, dests[0], &mut s, None, 4000) {
+            if let Some((pts, dist, tr)) =
+                grid.path_traced(start, dests[0], &mut s, block.as_ref(), 4000)
+            {
                 push(&mut options, "Direct", Some(((pts, dist), lbl(0))), &mut label);
                 trace = tr;
             }
         } else {
-            let direct = run(&mut s, None);
+            let direct = run(&mut s, block.as_ref());
             push(&mut options, "Direct", direct, &mut label);
         }
         // Combat field, built once and merged into BOTH variants: the patrol/LOS penalty is the
@@ -539,11 +559,17 @@ fn dispatch_route(
             if let Some(c) = combat.clone() {
                 crate::nav::NavGrid::merge_avoid(&mut cautious, c);
             }
+            if let Some(b) = &block {
+                crate::nav::NavGrid::merge_avoid(&mut cautious, b.clone());
+            }
             let r = run(&mut s, Some(&cautious));
             push(&mut options, "Cautious", r, &mut label);
             let mut wide = grid.build_avoid(&avoid_pts, AVOID_W_WIDE);
             if let Some(c) = combat {
                 crate::nav::NavGrid::merge_avoid(&mut wide, c);
+            }
+            if let Some(b) = &block {
+                crate::nav::NavGrid::merge_avoid(&mut wide, b.clone());
             }
             let r = run(&mut s, Some(&wide));
             push(&mut options, "Wide berth", r, &mut label);
