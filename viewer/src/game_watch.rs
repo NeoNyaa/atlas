@@ -349,14 +349,6 @@ fn apply_game_events(
     mut start_pt: ResMut<crate::pathfind::StartPoint>,
     mut progress: ResMut<crate::progress::PlayerProgress>,
     catalog: Option<Res<crate::tasks_panel::TaskCatalog>>,
-    route_result: Option<Res<crate::pathfind::RouteResult>>,
-    // Reader + writer of the same message type conflict as bare params (B0002); a ParamSet
-    // sequences the two accesses.
-    mut routes: ParamSet<(
-        MessageReader<crate::pathfind::RouteRequest>,
-        MessageWriter<crate::pathfind::RouteRequest>,
-    )>,
-    mut last_route: Local<Option<crate::pathfind::RouteRequest>>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut overlay: OverlayLink,
     menu: Option<Res<crate::menu::MenuState>>,
@@ -366,17 +358,6 @@ fn apply_game_events(
     mut toggles: ResMut<crate::ui::LayerToggles>,
     time: Res<Time>,
 ) {
-    // Shadow-read every route request the UI sends (readers have independent cursors, so this does
-    // not consume them): remember the latest real one so a new player fix can re-issue it from the
-    // new position — live "route from me" without any UI change.
-    for req in routes.p0().read() {
-        if !req.dests.is_empty() {
-            *last_route = Some(req.clone());
-        } else {
-            *last_route = None; // an explicit clear also stops re-routing
-        }
-    }
-
     let events: Vec<GameEvent> = match link.rx.lock() {
         Ok(rx) => rx.try_iter().collect(),
         Err(_) => return,
@@ -500,18 +481,11 @@ fn apply_game_events(
                     cam_cmd.eye = Some((pos, Vec3::ZERO));
                 }
                 // The pathfinder's "you are here" pin: every route (route-here / route tracked /
-                // navigate tab) starts from it when set. Moving it clears any drawn route
-                // (clear_route_on_start_move), so re-issue the last request from the new fix to
-                // keep a live route following the player.
+                // navigate tab) starts from it when set. A drawn route is deliberately NOT
+                // recomputed from the new fix — it persists as planned until the player asks for a
+                // new one (see pathfind::poll_route doc), so you keep seeing the route while you
+                // walk it and screenshot your way along.
                 start_pt.0 = Some(pos);
-                if let (Some(req), Some(res)) = (last_route.as_ref(), route_result.as_ref()) {
-                    use crate::pathfind::RouteStatus as RS;
-                    if matches!(res.status, RS::Ok | RS::Pending) {
-                        let mut req = req.clone();
-                        req.start = Some(pos);
-                        routes.p1().write(req);
-                    }
-                }
             }
             GameEvent::Task { id, status } => {
                 match status {

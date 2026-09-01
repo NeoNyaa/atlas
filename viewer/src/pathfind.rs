@@ -205,10 +205,9 @@ impl Plugin for PathfindPlugin {
             .init_resource::<NavTrace>()
             .add_systems(
                 Update,
-                // chained: nav-load -> stale-clear -> scripted-route -> dispatch -> poll -> draw.
+                // chained: nav-load -> scripted-route -> dispatch -> poll -> draw.
                 (
                     manage_nav,
-                    clear_route_on_start_move,
                     debug_route,
                     dispatch_route,
                     poll_route,
@@ -583,23 +582,12 @@ fn dispatch_route(
     task.0 = Some(t);
 }
 
-/// Moving/placing/removing the "you are here" pin invalidates any drawn route (it started from the
-/// OLD position) — clear it instead of leaving a stale, now-wrong polyline + distance on screen.
-/// Runs before dispatch so a same-frame new request still goes through.
-fn clear_route_on_start_move(
-    start_pt: Res<StartPoint>,
-    mut task: ResMut<PathfindTask>,
-    mut result: ResMut<RouteResult>,
-) {
-    if !start_pt.is_changed() || start_pt.is_added() {
-        return;
-    }
-    if result.status != RouteStatus::Idle || task.0.is_some() {
-        task.0 = None;
-        result.clear();
-    }
-}
-
+/// A drawn route PERSISTS across player-position changes. It is drawn from wherever it was
+/// requested and stays until the player asks for a new one (clicking an extract / a marker /
+/// PLAN LOOT RUN) or clears it — a fresh screenshot fix moving the "you are here" pin no longer
+/// wipes it, so you keep seeing the route you planned while you walk it. (The map-swap teardown
+/// still clears everything; that is a different map, not a new position on the same one.)
+///
 /// Poll the in-flight task; when it finishes, publish the polyline (or the error) to `RouteResult`.
 fn poll_route(
     mut task: ResMut<PathfindTask>,
