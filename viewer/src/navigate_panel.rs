@@ -756,6 +756,13 @@ pub fn navigate_tab(
                         // stands down: the whole card is ALSO a click target (route here), and
                         // without this guard ticking a box would fire a route as well.
                         let mut tick_hit = false;
+                        // The checkbox's screen rect, captured out of the card closure. The card's
+                        // `.interact(Sense::click())` below registers a click widget over the WHOLE
+                        // row AFTER the checkbox, so egui hit-tests the row on top and the checkbox
+                        // never sees its own click (`tick.changed()` stays false) — every tick read
+                        // as a plain row click and routed instead. The outer handler recovers the
+                        // tick by testing the click position against this rect.
+                        let mut tick_rect = egui::Rect::NOTHING;
                         let resp = theme::card(ui, border, |ui| {
                             ui.horizontal(|ui| {
                                 let mut on = selected;
@@ -771,6 +778,7 @@ pub fn navigate_tab(
                                     } else {
                                         "mark as usable this raid (the loot plan ends at one of these)"
                                     });
+                                tick_rect = tick.rect;
                                 tick_hit = tick.clicked() || tick.changed();
                                 if tick.changed() {
                                     if on {
@@ -850,7 +858,21 @@ pub fn navigate_tab(
                                 Color32::from_rgba_premultiplied(255, 255, 255, 5),
                             );
                         }
-                        if tick_hit {
+                        // The card's whole-row click widget shadows the checkbox (see `tick_rect`),
+                        // so a click landing inside the checkbox rect IS a tick, not a route.
+                        let tick_click = row.clicked()
+                            && !r.inactive
+                            && ui
+                                .input(|i| i.pointer.interact_pos())
+                                .is_some_and(|p| tick_rect.contains(p));
+                        if tick_click {
+                            if selected {
+                                ui_state.plan_extracts.remove(&r.title);
+                            } else {
+                                ui_state.plan_extracts.insert(r.title.clone());
+                            }
+                        }
+                        if tick_hit || tick_click {
                             // The tick box owns this click — selecting an extract must not also
                             // route to it.
                         } else if row.double_clicked() {
