@@ -171,21 +171,34 @@ impl RaidSide {
     }
 }
 
-/// MANUAL raid-side choice, for planning when the game is not running.
+/// The Navigation tab's raid-side selector — which faction's extracts to show / plan for.
 ///
-/// Side filtering used to exist ONLY when the live link had parsed `GroupMatchRaidSettings`, i.e.
-/// only while a raid was actually loading. At the desk — the primary planning case — a PMC saw
-/// Scav-only extracts in "nearest extract" and in loot plans, and could be routed to an exit they
-/// cannot use. The live value stays AUTHORITATIVE; this only fills the gap when it is absent.
+/// `Auto` defers to the live raid side parsed from `GroupMatchRaidSettings` (and shows everything
+/// when the logs are silent, e.g. desk planning). `Pmc` / `Scav` / `Both` are a MANUAL override
+/// that ALWAYS wins, including mid-raid: the log-derived side has been wrong in the field (Scav
+/// raid read as PMC and vice versa), so the player can force it and it stays forced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SidePref {
+    /// Follow the live raid side; show all extracts when it is unknown.
+    #[default]
+    Auto,
+    Pmc,
+    Scav,
+    /// Explicitly show every extract, regardless of what the logs say.
+    Both,
+}
+
+/// Persisted raid-side selection for the Navigation tab (config key `raidSide`).
 #[derive(Resource, Default)]
-pub struct SideChoice(pub Option<RaidSide>);
+pub struct SideChoice(pub SidePref);
 
 impl SideChoice {
     pub fn load() -> Self {
         Self(match crate::menu::config_str_pub("raidSide").as_deref() {
-            Some("pmc") => Some(RaidSide::Pmc),
-            Some("scav") => Some(RaidSide::Scav),
-            _ => None,
+            Some("pmc") => SidePref::Pmc,
+            Some("scav") => SidePref::Scav,
+            Some("both") => SidePref::Both,
+            _ => SidePref::Auto,
         })
     }
 
@@ -194,21 +207,28 @@ impl SideChoice {
         crate::menu::save_config_str_pub(
             "raidSide",
             match self.0 {
-                Some(RaidSide::Pmc) => "pmc",
-                Some(RaidSide::Scav) => "scav",
-                None => "",
+                SidePref::Pmc => "pmc",
+                SidePref::Scav => "scav",
+                SidePref::Both => "both",
+                SidePref::Auto => "",
             },
         )
     }
 }
 
-/// The side to filter by: the LIVE raid side when the logs know it, else the user's manual choice,
-/// else None (show everything — never guess).
+/// The side to filter extracts by. A manual `Pmc` / `Scav` / `Both` choice wins outright; `Auto`
+/// (the default) uses the LIVE raid side when the logs know it, else `None` (show everything —
+/// never guess). `Both` also maps to `None`, but as a deliberate choice rather than a fallback.
 pub fn effective_side(
     link: Option<&GameLink>,
     choice: Option<&SideChoice>,
 ) -> Option<RaidSide> {
-    link.and_then(|l| l.raid_side).or_else(|| choice.and_then(|c| c.0))
+    match choice.map(|c| c.0).unwrap_or_default() {
+        SidePref::Pmc => Some(RaidSide::Pmc),
+        SidePref::Scav => Some(RaidSide::Scav),
+        SidePref::Both => None,
+        SidePref::Auto => link.and_then(|l| l.raid_side),
+    }
 }
 
 /// A running raid, from `|application|GameStarted:`.

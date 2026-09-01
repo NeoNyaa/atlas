@@ -1507,18 +1507,25 @@ fn layers_panel(
                             poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract, &poi_counts);
                             ui.horizontal(|ui| {
                                 ui.add_space(30.0);
+                                let manual = !matches!(
+                                    side_choice.as_deref().map(|c| c.0).unwrap_or_default(),
+                                    crate::game_watch::SidePref::Auto
+                                );
                                 let note = match raid_side {
                                     Some(side) => format!(
-                                        "{} raid \u{00B7} showing eligible + shared extracts",
-                                        side.label()
+                                        "{} \u{00B7} showing eligible + shared extracts{}",
+                                        side.label(),
+                                        if manual { " (your choice)" } else { " (from the raid)" }
                                     ),
+                                    None if manual => "both sides \u{00B7} showing all extracts (your choice)".into(),
                                     None => "side not in logs \u{00B7} showing all extracts".into(),
                                 };
                                 ui.label(RichText::new(note).size(9.0).italics().color(MUTED))
                                     .on_hover_text(
-                                        "Atlas uses raidSettings.side from Tarkov's own \
-                                         GroupMatchRaidSettings log event. If EFT omits that \
-                                         event, Atlas does not guess.",
+                                        "Auto uses raidSettings.side from Tarkov's own \
+                                         GroupMatchRaidSettings log event (Atlas does not guess \
+                                         when it is absent). Set the side manually in the \
+                                         Navigation tab to override it.",
                                     );
                             });
                             poi_row(ui, &mut toggles.doors, "Doors", PoiLayer::Door, &poi_counts);
