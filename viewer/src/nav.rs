@@ -77,6 +77,13 @@ pub(crate) fn chord_rise_max(step_up: f32) -> f32 {
 /// "avoid if possible" — they still cross a zone when no reasonable detour exists.
 pub type AvoidMap = std::collections::HashMap<u32, f32>;
 
+/// Sentinel avoid-cost meaning "this cell is HARD-blocked, not merely expensive". The router and
+/// the planner's reachability flood skip such a cell exactly like an unwalkable one, overriding
+/// even a forced door edge. Built by [`NavGrid::build_block`] and merged into the ordinary avoid
+/// field with [`NavGrid::merge_avoid`]; any finite penalty below this stays a soft detour weight.
+/// Used for locked doors / containers whose key the player has not ticked in the Layers tab.
+pub const BLOCK_COST: f32 = 1.0e9;
+
 /// A loaded, immutable nav grid for one map. Shared read-only across async query tasks.
 pub struct NavGrid {
     pub min_x: f32,
@@ -505,6 +512,33 @@ impl NavGrid {
                     if w > *e {
                         *e = w;
                     }
+                }
+            }
+        }
+        m
+    }
+
+    /// Hard-block field: every cell within `radius_m` of a point gets [`BLOCK_COST`]. Unlike
+    /// [`Self::build_avoid`]'s linear falloff this is a flat wall — a route may not enter these
+    /// cells at all and the planner's flood treats them as unreachable. Merge into an avoid field
+    /// with [`Self::merge_avoid`] (the sentinel outranks every soft weight, so it wins the max).
+    pub fn build_block(&self, pts: &[(Vec3, f32)]) -> AvoidMap {
+        let mut m = AvoidMap::new();
+        for (p, r) in pts {
+            let r = r.max(self.res);
+            let cr = (r / self.res).ceil() as i64;
+            let cx = ((p.x - self.min_x) / self.res).round() as i64;
+            let cz = ((p.z - self.min_z) / self.res).round() as i64;
+            for dz in -cr..=cr {
+                for dx in -cr..=cr {
+                    let (jx, jz) = (cx + dx, cz + dz);
+                    if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+                        continue;
+                    }
+                    if ((dx * dx + dz * dz) as f32).sqrt() * self.res > r {
+                        continue;
+                    }
+                    m.insert((jz * self.nx as i64 + jx) as u32, BLOCK_COST);
                 }
             }
         }
@@ -1109,6 +1143,11 @@ impl NavGrid {
                     continue;
                 }
                 let nc = (jz * nx + jx) as usize;
+                // HARD block (a locked door without its key): refuse the cell like an unwalkable
+                // one, BEFORE the forced-door waiver below — a blocked doorway stays shut.
+                if avoid.is_some_and(|a| a.get(&(nc as u32)).is_some_and(|&p| p >= BLOCK_COST)) {
+                    continue;
+                }
                 let nl = self.best_layer(nc, h_cur);
                 if nl < 0 {
                     continue;
@@ -1172,7 +1211,17 @@ impl NavGrid {
     /// heuristic). The field lives in `s` (generation-stamped `g`); query it with [`Self::field_dist`].
     /// One bounded flood lets a planner test reachability/distance of MANY points without ever
     /// paying an exhaustive failed A* per unreachable point. Returns false if the start won't snap.
-    pub fn dijkstra_field(&self, from: Vec3, g_limit: f32, s: &mut Scratch) -> bool {
+    ///
+    /// `avoid` is consulted ONLY for [`BLOCK_COST`] cells (hard blocks, e.g. locked doors) — soft
+    /// penalties are ignored so the field's `g` stays real walked metres. The block skip must match
+    /// `astar`'s exactly or the planner would keep a candidate the router then cannot reach.
+    pub fn dijkstra_field(
+        &self,
+        from: Vec3,
+        g_limit: f32,
+        s: &mut Scratch,
+        avoid: Option<&AvoidMap>,
+    ) -> bool {
         let Some((sc, sl)) = self.snap_start(from.x, from.y, from.z, self.rings(START_SNAP_M)) else {
             return false;
         };
@@ -1249,6 +1298,10 @@ impl NavGrid {
                     continue;
                 }
                 let nc = (jz * nx + jx) as usize;
+                // Same hard-block skip as astar, in the same place — reachability MUST agree.
+                if avoid.is_some_and(|a| a.get(&(nc as u32)).is_some_and(|&p| p >= BLOCK_COST)) {
+                    continue;
+                }
                 let nl = self.best_layer(nc, h_cur);
                 if nl < 0 {
                     continue;

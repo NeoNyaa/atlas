@@ -247,8 +247,13 @@ fn dispatch_plan(
                         && matches!(layer, Some(crate::poi::PoiLayer::LooseLoot)))) // priced loose
         })
         .filter(|(gt, _, _, _, _, _, _, _)| {
+            // A locked CONTAINER (safe / car trunk / cache) IS the locked thing — drop it outright
+            // when its key is not ticked. Kept tight (was 14 m, which nuked whole rooms of loot you
+            // could actually reach): rooms behind a locked DOOR are handled properly by the nav
+            // block below (`locked_pts`), which seals the doorway so the reachability flood prunes
+            // what is genuinely walled off and keeps what has another way in.
             !locks.iter().any(|(lock_gt, keys)| {
-                lock_gt.translation().distance(gt.translation()) <= 14.0
+                lock_gt.translation().distance(gt.translation()) <= 6.0
                     && !keys.0.is_empty()
                     && !keys.0.iter().any(|key| progress.owns_key(key))
             })
@@ -322,6 +327,20 @@ fn dispatch_plan(
         }
     }
 
+    // ---- locked doors: seal the doorway of every lock/door whose key the player has NOT ticked
+    // in the Layers tab. Merged into the same avoid field as a HARD block (BLOCK_COST), so the
+    // reachability flood in `solve` prunes any loot that is only reachable through it, and any
+    // route drawn to a surviving stop detours the same doorway. 1.6 m half-width matches the
+    // bake's own DOOR_STAMP_R (1.1 m) plus a margin — wide enough to close a leaf, narrow enough
+    // not to wall off a corridor running past it.
+    let locked_pts: Vec<(Vec3, f32)> = locks
+        .iter()
+        .filter(|(_, keys)| {
+            !keys.0.is_empty() && !keys.0.iter().any(|key| progress.owns_key(key))
+        })
+        .map(|(gt, _)| (gt.translation(), 1.6_f32))
+        .collect();
+
     // "Avoid combat": the game's patrol lines + ground an AI-PMC anchor can actually see.
     // Gathered here because it needs the patrol polylines rather than a per-marker radius, and
     // merged into the same avoid field so the tour and any route drawn to one of its stops agree
@@ -356,6 +375,13 @@ fn dispatch_plan(
                 }
             }
         }
+        if !locked_pts.is_empty() {
+            let block = grid.build_block(&locked_pts);
+            match avoid.as_mut() {
+                Some(a) => crate::nav::NavGrid::merge_avoid(a, block),
+                None => avoid = Some(block),
+            }
+        }
         solve(&grid, start, cands, extracts, max_stops, budget, avoid.as_ref())
     });
     task.0 = Some(t);
@@ -386,7 +412,7 @@ pub(crate) fn solve(
     // verification prohibitively memory hungry even though the phases never overlap.
     let (cands, extracts) = {
         let mut field_s = crate::nav::pooled_scratch(grid.nodes());
-        if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s) {
+        if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s, avoid) {
             return Err("start is off the walkable mesh".into());
         }
         let cands: Vec<Cand> = cands
@@ -518,7 +544,7 @@ pub(crate) fn solve(
                 .fold(0.0f32, f32::max)
                 * 1.6;
             let limit = reach.clamp(50.0, walk_budget_m * 1.4);
-            if !grid.dijkstra_field(pts[i], limit, &mut fs) {
+            if !grid.dijkstra_field(pts[i], limit, &mut fs, avoid) {
                 continue;
             }
             for j in 0..np {

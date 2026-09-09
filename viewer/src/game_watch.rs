@@ -171,21 +171,34 @@ impl RaidSide {
     }
 }
 
-/// MANUAL raid-side choice, for planning when the game is not running.
+/// The Navigation tab's raid-side selector — which faction's extracts to show / plan for.
 ///
-/// Side filtering used to exist ONLY when the live link had parsed `GroupMatchRaidSettings`, i.e.
-/// only while a raid was actually loading. At the desk — the primary planning case — a PMC saw
-/// Scav-only extracts in "nearest extract" and in loot plans, and could be routed to an exit they
-/// cannot use. The live value stays AUTHORITATIVE; this only fills the gap when it is absent.
+/// `Auto` defers to the live raid side parsed from `GroupMatchRaidSettings` (and shows everything
+/// when the logs are silent, e.g. desk planning). `Pmc` / `Scav` / `Both` are a MANUAL override
+/// that ALWAYS wins, including mid-raid: the log-derived side has been wrong in the field (Scav
+/// raid read as PMC and vice versa), so the player can force it and it stays forced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SidePref {
+    /// Follow the live raid side; show all extracts when it is unknown.
+    #[default]
+    Auto,
+    Pmc,
+    Scav,
+    /// Explicitly show every extract, regardless of what the logs say.
+    Both,
+}
+
+/// Persisted raid-side selection for the Navigation tab (config key `raidSide`).
 #[derive(Resource, Default)]
-pub struct SideChoice(pub Option<RaidSide>);
+pub struct SideChoice(pub SidePref);
 
 impl SideChoice {
     pub fn load() -> Self {
         Self(match crate::menu::config_str_pub("raidSide").as_deref() {
-            Some("pmc") => Some(RaidSide::Pmc),
-            Some("scav") => Some(RaidSide::Scav),
-            _ => None,
+            Some("pmc") => SidePref::Pmc,
+            Some("scav") => SidePref::Scav,
+            Some("both") => SidePref::Both,
+            _ => SidePref::Auto,
         })
     }
 
@@ -194,21 +207,28 @@ impl SideChoice {
         crate::menu::save_config_str_pub(
             "raidSide",
             match self.0 {
-                Some(RaidSide::Pmc) => "pmc",
-                Some(RaidSide::Scav) => "scav",
-                None => "",
+                SidePref::Pmc => "pmc",
+                SidePref::Scav => "scav",
+                SidePref::Both => "both",
+                SidePref::Auto => "",
             },
         )
     }
 }
 
-/// The side to filter by: the LIVE raid side when the logs know it, else the user's manual choice,
-/// else None (show everything — never guess).
+/// The side to filter extracts by. A manual `Pmc` / `Scav` / `Both` choice wins outright; `Auto`
+/// (the default) uses the LIVE raid side when the logs know it, else `None` (show everything —
+/// never guess). `Both` also maps to `None`, but as a deliberate choice rather than a fallback.
 pub fn effective_side(
     link: Option<&GameLink>,
     choice: Option<&SideChoice>,
 ) -> Option<RaidSide> {
-    link.and_then(|l| l.raid_side).or_else(|| choice.and_then(|c| c.0))
+    match choice.map(|c| c.0).unwrap_or_default() {
+        SidePref::Pmc => Some(RaidSide::Pmc),
+        SidePref::Scav => Some(RaidSide::Scav),
+        SidePref::Both => None,
+        SidePref::Auto => link.and_then(|l| l.raid_side),
+    }
 }
 
 /// A running raid, from `|application|GameStarted:`.
@@ -349,14 +369,6 @@ fn apply_game_events(
     mut start_pt: ResMut<crate::pathfind::StartPoint>,
     mut progress: ResMut<crate::progress::PlayerProgress>,
     catalog: Option<Res<crate::tasks_panel::TaskCatalog>>,
-    route_result: Option<Res<crate::pathfind::RouteResult>>,
-    // Reader + writer of the same message type conflict as bare params (B0002); a ParamSet
-    // sequences the two accesses.
-    mut routes: ParamSet<(
-        MessageReader<crate::pathfind::RouteRequest>,
-        MessageWriter<crate::pathfind::RouteRequest>,
-    )>,
-    mut last_route: Local<Option<crate::pathfind::RouteRequest>>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut overlay: OverlayLink,
     menu: Option<Res<crate::menu::MenuState>>,
@@ -366,17 +378,6 @@ fn apply_game_events(
     mut toggles: ResMut<crate::ui::LayerToggles>,
     time: Res<Time>,
 ) {
-    // Shadow-read every route request the UI sends (readers have independent cursors, so this does
-    // not consume them): remember the latest real one so a new player fix can re-issue it from the
-    // new position — live "route from me" without any UI change.
-    for req in routes.p0().read() {
-        if !req.dests.is_empty() {
-            *last_route = Some(req.clone());
-        } else {
-            *last_route = None; // an explicit clear also stops re-routing
-        }
-    }
-
     let events: Vec<GameEvent> = match link.rx.lock() {
         Ok(rx) => rx.try_iter().collect(),
         Err(_) => return,
@@ -500,18 +501,11 @@ fn apply_game_events(
                     cam_cmd.eye = Some((pos, Vec3::ZERO));
                 }
                 // The pathfinder's "you are here" pin: every route (route-here / route tracked /
-                // navigate tab) starts from it when set. Moving it clears any drawn route
-                // (clear_route_on_start_move), so re-issue the last request from the new fix to
-                // keep a live route following the player.
+                // navigate tab) starts from it when set. A drawn route is deliberately NOT
+                // recomputed from the new fix — it persists as planned until the player asks for a
+                // new one (see pathfind::poll_route doc), so you keep seeing the route while you
+                // walk it and screenshot your way along.
                 start_pt.0 = Some(pos);
-                if let (Some(req), Some(res)) = (last_route.as_ref(), route_result.as_ref()) {
-                    use crate::pathfind::RouteStatus as RS;
-                    if matches!(res.status, RS::Ok | RS::Pending) {
-                        let mut req = req.clone();
-                        req.start = Some(pos);
-                        routes.p1().write(req);
-                    }
-                }
             }
             GameEvent::Task { id, status } => {
                 match status {

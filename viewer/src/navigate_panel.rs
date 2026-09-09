@@ -98,7 +98,8 @@ struct Row {
 pub(crate) struct NavLive<'w> {
     epoch: Res<'w, crate::render::MapEpoch>,
     game_link: Option<Res<'w, crate::game_watch::GameLink>>,
-    /// Manual PMC/Scav choice for desk planning; the live raid side still wins when known.
+    /// Raid-side selector for the extract list: Auto (follow the live raid side) or a manual
+    /// PMC / Scav / Both that overrides it — the log-derived side is not always right.
     side_choice: Option<ResMut<'w, crate::game_watch::SideChoice>>,
     /// Overlay presenting over the game — the tab stands down (bundled here for the same
     /// 16-param reason as ui.rs's GfxUiParams: navigate_tab sits at the system-param limit).
@@ -461,7 +462,7 @@ pub fn navigate_tab(
                             RichText::new("PLAN LOOT RUN").size(theme::SIZE_LABEL).strong()
                                 .color(if can_plan { theme::ACCENT } else { theme::FAINT }))
                             .min_size(full).corner_radius(0.0))
-                        .on_hover_text("pick the highest-value loot tour that fits the budget, ending at an extract \u{00B7} honors the avoid options")
+                        .on_hover_text("pick the highest-value loot tour that fits the budget, ending at an extract \u{00B7} honors the avoid options and skips loot behind doors you have no key for (tick your keys under Layers)")
                         .on_disabled_hover_text(if !ready {
                             "routing has not been built for this map"
                         } else if active_n == 0 {
@@ -580,43 +581,36 @@ pub fn navigate_tab(
             // mutate the set later in this same closure and a stale count would render a click
             // behind by one frame.
             let sel_now = ui_state.plan_extracts.len();
-            // WHICH SIDE ARE YOU? The live link answers this only while a raid is loading; at
-            // the desk (the main planning case) it is unknown, and an unknown side used to mean
-            // "show every extract", so a PMC could plan a run that ends at a Scav-only exit.
-            // Persisted, and overridden by the live value whenever the logs actually know.
+            // WHICH SIDE'S EXTRACTS? `Auto` follows the raid side EFT writes to its logs, but that
+            // has been wrong in the field, so PMC / Scav / both are a manual override that always
+            // wins (mid-raid included). Persisted across launches.
             {
-                let live_known =
-                    live.game_link.as_ref().and_then(|l| l.raid_side).is_some();
+                use crate::game_watch::SidePref;
+                let live_raid = live.game_link.as_ref().and_then(|l| l.raid_side);
+                let cur = live.side_choice.as_deref().map(|c| c.0).unwrap_or_default();
                 let mut changed = None;
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("side").size(theme::SIZE_CAPTION).color(theme::MUTED),
+                        RichText::new("extracts").size(theme::SIZE_CAPTION).color(theme::MUTED),
                     );
-                    let cur = live.side_choice.as_deref().and_then(|c| c.0);
-                    let mut chip = |ui: &mut egui::Ui, label: &str, val: Option<crate::game_watch::RaidSide>| {
-                        if ui
-                            .selectable_label(cur == val && !live_known, label)
-                            .clicked()
-                        {
+                    let mut chip = |ui: &mut egui::Ui, label: &str, val: SidePref| {
+                        if ui.selectable_label(cur == val, label).clicked() {
                             changed = Some(val);
                         }
                     };
-                    ui.add_enabled_ui(!live_known, |ui| {
-                        chip(ui, "PMC", Some(crate::game_watch::RaidSide::Pmc));
-                        chip(ui, "Scav", Some(crate::game_watch::RaidSide::Scav));
-                        chip(ui, "both", None);
-                    });
-                    if live_known {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} (from the raid)",
-                                raid_side.map(|s| s.label()).unwrap_or("")
-                            ))
-                            .size(theme::SIZE_TINY)
-                            .color(theme::OK),
-                        );
-                    }
+                    chip(ui, "auto", SidePref::Auto);
+                    chip(ui, "PMC", SidePref::Pmc);
+                    chip(ui, "Scav", SidePref::Scav);
+                    chip(ui, "both", SidePref::Both);
                 });
+                // What Auto currently resolves to, so the player can see whether to override it.
+                if cur == SidePref::Auto {
+                    let (txt, col) = match live_raid {
+                        Some(s) => (format!("raid detected as {} \u{2014} not sure? pick a side", s.label()), theme::OK),
+                        None => ("no raid detected \u{2014} showing all extracts".to_string(), theme::FAINT),
+                    };
+                    ui.label(RichText::new(txt).size(theme::SIZE_TINY).color(col));
+                }
                 if let Some(v) = changed {
                     if let Some(c) = live.side_choice.as_deref_mut() {
                         c.0 = v;
@@ -756,6 +750,13 @@ pub fn navigate_tab(
                         // stands down: the whole card is ALSO a click target (route here), and
                         // without this guard ticking a box would fire a route as well.
                         let mut tick_hit = false;
+                        // The checkbox's screen rect, captured out of the card closure. The card's
+                        // `.interact(Sense::click())` below registers a click widget over the WHOLE
+                        // row AFTER the checkbox, so egui hit-tests the row on top and the checkbox
+                        // never sees its own click (`tick.changed()` stays false) — every tick read
+                        // as a plain row click and routed instead. The outer handler recovers the
+                        // tick by testing the click position against this rect.
+                        let mut tick_rect = egui::Rect::NOTHING;
                         let resp = theme::card(ui, border, |ui| {
                             ui.horizontal(|ui| {
                                 let mut on = selected;
@@ -771,6 +772,7 @@ pub fn navigate_tab(
                                     } else {
                                         "mark as usable this raid (the loot plan ends at one of these)"
                                     });
+                                tick_rect = tick.rect;
                                 tick_hit = tick.clicked() || tick.changed();
                                 if tick.changed() {
                                     if on {
@@ -850,7 +852,21 @@ pub fn navigate_tab(
                                 Color32::from_rgba_premultiplied(255, 255, 255, 5),
                             );
                         }
-                        if tick_hit {
+                        // The card's whole-row click widget shadows the checkbox (see `tick_rect`),
+                        // so a click landing inside the checkbox rect IS a tick, not a route.
+                        let tick_click = row.clicked()
+                            && !r.inactive
+                            && ui
+                                .input(|i| i.pointer.interact_pos())
+                                .is_some_and(|p| tick_rect.contains(p));
+                        if tick_click {
+                            if selected {
+                                ui_state.plan_extracts.remove(&r.title);
+                            } else {
+                                ui_state.plan_extracts.insert(r.title.clone());
+                            }
+                        }
+                        if tick_hit || tick_click {
                             // The tick box owns this click — selecting an extract must not also
                             // route to it.
                         } else if row.double_clicked() {
