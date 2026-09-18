@@ -211,6 +211,16 @@ Measured on the shipped bundle (24 cubemaps): `rain_1k_sharp_DXT1`, 1024 px, `is
 
 **The native viewer does not read `sky.json` or the exported face PNGs; `tools/blender/make_sky_equirect.py` does, to build a world texture.** `viewer/src/main.rs:1638-1648` `build_sky_cubemap` calls `build_procedural_sky` unconditionally and nothing else. The comment at `:1639-1644` records why: the exported assets are environment **captures** - photo-spheres with treelines baked into the horizon - so using them as a sky dome puts photographic trees behind real map geometry.
 
+**The Blender path reached the same conclusion from the other end, and later.** `example_scene.py`
+did use the exported cubemap as its world texture, for both lighting and backdrop, and that is
+exactly the case the viewer comment warns about: a photo-sphere's baked treeline sitting on the
+horizon behind real map geometry, at 128 px per face (~0.70 deg/texel) so it is a soft wash as well
+as a wrong one. Photoreal mode now splits the two roles through `Light Path > Is Camera Ray` -
+lighting, shadows and reflections keep the capture, which is what a capture is *for* and what the
+fitted `SUN_ENERGY`/`SKY_STRENGTH` pair was solved against, while the camera sees a physical sky
+exposure-matched to it by `BACKDROP_RATIO`. Game mode keeps the capture on both, because parity
+means showing what the game shows. See photorealism.md §14 and `tools/blender/fit_sky_backdrop.py`.
+
 The dome that ships is 6 × 128 × 128 `Rgba16Float` (`main.rs:1651`, `:1696`), with `TextureViewDimension::Cube` (`:1700`), built from:
 
 ```

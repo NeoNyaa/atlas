@@ -13,8 +13,9 @@
 11. [The .eftchar container: exact byte layout](#11-the-eftchar-container-exact-byte-layout)
 12. [What is dropped](#12-what-is-dropped)
 13. [Consumer-side math: pose, blend, skin](#13-consumer-side-math-pose-blend-skin)
-14. [Invariants and their failure signatures](#14-invariants-and-their-failure-signatures)
-15. [Old patterns](#15-old-patterns)
+14. [The weapon hold through a cross-fade](#14-the-weapon-hold-through-a-cross-fade)
+15. [Invariants and their failure signatures](#15-invariants-and-their-failure-signatures)
+16. [Old patterns](#16-old-patterns)
 
 ---
 
@@ -329,6 +330,36 @@ Every attachment vertex is pinned to the target bone with full weight (`jointInd
 
 **The slot→bone mapping is NOT in the asset.** The `Dress` component lists only renderers and a decal type; the real mapping lives in the runtime's `PlayerBody.SlotView`. So the target bone comes from the registry (`extraction/characters/characters.json`, e.g. `"bone": "Base HumanHead"` → index 24) and is an explicit authoring choice, flagged as such. This is the one place in the character pipeline where a value is authored rather than derived.
 
+**WHICH FRAME THE CONSUMER COMPOSES IT IN is the other authored half, and it is not the weapon's.**
+Storing `localRot` says nothing about what it is local *to*, and the two obvious answers differ by
+exactly 90 degrees on this rig:
+
+| thing | authored in | consumer composes |
+|---|---|---|
+| the weapon (`.eftweap`) | the ENGINE bone frame | `pose.matrix @ q4⁻¹ @ local` - undo the importer's bone-axis permutation (`tools/blender/import_eftweap.py:222-239`) |
+| rigid equipment (attachment) | UNITY Y-UP | `pose.matrix @ local` - no undo (`tools/blender/import_eftchar.py::_build_attachment`) |
+
+The reason is that this rig is **+X-down-the-bone**, so `q4` (the signed permutation carrying the
+rig's dominant bone axis to Blender's +Y) is a 90° rotation, and the two frames disagree by it.
+Measured on `out/characters/kit_bear_5`, head bone at bind pose:
+
+```
+ENGINE  (pose.matrix @ q4⁻¹)   +X -> world (0.00, -0.36, +0.93)   up the skull
+                               +Y -> world (0.00, -0.93, -0.36)   forward and down
+BLENDER (pose.matrix)          +Y -> world (0.00, -0.36, +0.93)   up the skull
+```
+
+An equipment prefab is authored Unity Y-up - verified identical on `cap_BEAR`,
+`item_equipment_helmet_LSHZ` and `item_equipment_helmet_ULACH_coyote`, each a prefab root at
+identity above a mesh node carrying a single −90° X rotation, which is the DCC-Z-up → Unity-Y-up
+fixup. So the item's own up is +Y, and hanging it in an X-up frame tips the crown forward out of the
+face. Nothing errors: the geometry is present, watertight and correctly textured, and only a render
+shows it.
+
+**`viewer/src/character/rig.rs:293-306` spawns attachments as children of a bone entity carrying
+`att.local` directly**, so whether Atlas is correct depends on which frame its bone entities are in;
+if they are the engine/skeleton frame, the viewer tips helmets the same way.
+
 The weapon uses a different mechanism: no attachment record at all. The consumer looks up the rig bone named `Weapon_root` (measured index 68) and parents the `.eftweap` mesh under an identity offset node (`viewer/src/character/weapon.rs:21`, `viewer/src/character/mod.rs:171-226`). The rig also ships `weapon_holster` (75) and `weapon_holster1` (76) for the slung pose.
 
 ---
@@ -462,7 +493,72 @@ where `World(b)` is the forward-pass product of local TRS matrices from the root
 
 ---
 
-## 14. Invariants and their failure signatures
+## 14. The weapon hold through a cross-fade
+
+**A local-space blend does not preserve a world-space relationship between two chains, and the weapon hold is one.** This is not a bug in the blend - §13's per-bone accumulation is what Mecanim does and what the pack's own consumer must do - it is a consequence of it that anything stitching clips together has to correct.
+
+The two chains are different lengths:
+
+```
+Weapon_root       <- Base HumanRibcage                             4 joints from the root
+Base HumanRPalm   <- RForearm3 <- .. <- RCollarbone <- Ribcage     6 joints further out
+```
+
+Every joint in a fade contributes its own interpolated rotation, so through the window the weapon and the hands travel different arcs and separate. Measured with `out/characters/scav` on the repo's own action shots:
+
+| shot | rifle off the right hand | left hand off the rifle |
+|---|---|---|
+| `a02_sprint-stop` | 90 mm peak | 139 mm peak |
+| `a03_prone-crawl` | 110 mm peak | 204 mm peak |
+| `a01_firing-beat` | 41 mm peak | 144 mm peak |
+
+**The source data is not at fault.** Within a single clip `Weapon_root` is rigid to the right palm to under 1 mm in **573 of 662 clips**, and rigid to BOTH palms in **445**. The 89 that are not rigid are the grenade (`rgd5_*`), holster (`idle_weapon_in`/`_out`), melee (`axe_look`, `knife_look`) and vault (`Start_Top`/`End_Top`) clips, where the weapon genuinely leaves the hand. The grip offset is **not** a rig constant - it differs between clips by up to 1593 mm - so it must be read per clip and per frame, never baked.
+
+### 14.1 The clips that key no weapon at all
+
+A second, independent defect, and on a stitched shot it is the **louder** of the two. **33 of the 662 clips have no `Weapon_root` track whatsoever** - `Fall`, `Fall_End`, `Jump_*_Sprint`, the whole `Prone_Turn_*` fan, `Start/Move/End_Top` (vault), `Stand_Kick`, `T_Pose`, `GUI_EmptyHands_Idle_0`, `stand_Idle_no_weapons_0`, and `Transition_Sprint_to_Stand`.
+
+That is not corruption. The game's controller runs ten layers and weapon handling is its own, so a base-locomotion clip legitimately keys only the body and lets another layer place the weapon. **Offline there is no such layer**, and `_clip_locals` fills an unkeyed bone from the **rest local** (`tools/blender/import_eftchar.py:682-684`) - so the rifle parks near the ribcage and stays there while the arms move. This is wrong for the clip's **entire length**, fade or no fade, which is why it reads far worse on screen than the blend artefact: the weapon ends up floating at head height with no hand near it.
+
+Measured on `Transition_Sprint_to_Stand`, which the `a02_sprint-stop` shot uses: the rest fallback sits **148 mm** from where `Weapon_root_3rd_anim` puts it and its distance to the right palm wanders over **109-194 mm** across the segment, against the 184.7 mm the neighbouring `sprint_slow_0` holds rigidly.
+
+**`Weapon_root_3rd_anim` is not the substitute it looks like.** On two locomotion clips the two bones are world-identical, which invites treating one as a mirror of the other - but across the **629 clips that key both, they diverge by up to 420 mm** (mean 4.3 mm). It is a different bone with its own job.
+
+What is available is the grip the *neighbouring* clips authored, so the socket is carried across the gap: every active clip votes with its own weight, one that keys the weapon voting for the grip it authored and one that does not voting for the grip already being carried. The value therefore eases from the outgoing clip's grip into the incoming clip's across a fade and holds flat in between, instead of snapping when the last keyed clip drops out of the blend. The weapon is then hung off the right palm at that grip.
+
+Scope check on the repo's own shots: of the six action shots, exactly **one armed shot** is affected (`a02_sprint-stop`, via `Transition_Sprint_to_Stand`). `a05_melee` uses `Stand_Kick`/`Stand_Kick_Fail` but draws no weapon.
+
+### 14.2 Which correction, and why not the obvious one
+
+Moving the **weapon** onto the right hand is the obvious fix and it is the wrong one. It pins the rifle to the right palm exactly, but it drags the rifle away from wherever the left arm's blend put it: measured, the left hand went from 139 mm off the foregrip to **304 mm** off it. It converts one artefact into a worse one.
+
+The correction is to leave the weapon on its blended local and **solve both arms onto it**. The weapon rides a short chain so its blended pose is already close to authored; the palms are what the blend throws off, so the palms are what to correct. This is also what the game does - the Player prefab runs `FullBodyBipedIK` / `SimpleTIK` *after* the Mecanim blend, and the rig ships `IK_S_LPalm` / `IK_S_RPalm` effectors and `Bend_Goal_Left` / `Bend_Goal_Right` pole targets for exactly that pass. In the shipped curves those effectors are coincident with the palms to **0.0 mm**, i.e. the clip data already contains the solved result, so reproducing the solve at the blend is the whole job.
+
+### 14.3 The solve
+
+`tools/blender/weapon_hold.py`, pure numpy so it is testable outside Blender. Per frame, only when more than one clip is active:
+
+0. Carry the socket across any clip that keys no weapon (§14.1), so the reference frame the next two steps read against is a real one.
+1. For each active clip `i` at its own local time, FK that clip alone and take the grip it authored, `Gᵢ = World_i(Weapon_root)⁻¹ · World_i(palm)`. A clip that keys no weapon is read against the SAME carried socket, so its authored palms reproduce exactly at `w=1`.
+2. Blend the `Gᵢ` on TRS with the same weights and hemisphere-aligned nlerp as the pose blend, and hang the result off the blended weapon: `target = World(Weapon_root) · Ḡ`.
+3. Analytic two-bone IK per arm onto that target - law of cosines for the elbow's position along the shoulder→target axis, `Bend_Goal_*` for which way it swings out of it. The three `Forearm1..3` twist bones keep their locals so their share of the roll rides along; the palm's local is then set to land the wrist on the authored grip **orientation** as well as its position.
+
+Two properties make this safe to leave on:
+
+- **With one active clip it is a no-op** - the target is that clip's own palm - so an unfaded frame is untouched and nothing outside a fade window can regress. The implementation skips the work entirely rather than relying on it cancelling.
+- **It assumes no rigidity.** The grip is read per frame, so the 89 clips where the hand really does leave the weapon reproduce exactly as authored.
+
+Elbows are never driven past `0.999` of reach: at full extension the IK plane is undefined and the joint pops between frames.
+
+**Result** on the same three shots: both hands land on the authored grip to **0.000 mm** on every frame, with 29 to 190 mm of arm reach still in hand and zero reach clamps.
+
+### 14.4 Scope
+
+This corrects the hold. It does **not** correct foot contact, which breaks through a fade for the same reason and has its own remedy (`foot_driven_positions`, derived from the planted toe rather than the root-motion channel). A fade between clips that disagree about speed still skates by `~0.5 · Δv · blend` metres regardless of either; that is a *staging* problem, fixed by feeding a transition the clip it was authored to follow.
+
+---
+
+## 15. Invariants and their failure signatures
 
 The "what you SEE" column records observations from the source notes taken when each invariant was broken; those signatures are not reproducible from the repo as it stands.
 
@@ -478,6 +574,8 @@ The "what you SEE" column records observations from the source notes taken when 
 | bone remap from the authoritative source | trusting `Skin._bonePaths` over `Mesh.m_BoneNameHashes` | limbs animate to the wrong joints - an arm follows the leg. Recorded shipped disagreements: `usec_upper_commando` shifted two slots, `Top_BOSS_Killa_base` a different length (49 vs 48) |
 | `parents[i] < i` | unsorted hierarchy | a forward-pass world-matrix computation reads a parent that has not been written yet: children lag one frame or jitter. Both emitter and loader assert it |
 | binding curve widths sum to the clip's curve count | assuming a width, or ignoring the euler attribute | curves are read one slot off; the animation is smooth, connected, unit-quaternion clean, and completely wrong. The build fails on the sum mismatch |
+| an attachment composed in the frame it was AUTHORED in | using the weapon's rule on rigid equipment, i.e. undoing the `q4` bone-axis permutation | the item is present, watertight and correctly textured, and rotated 90 degrees: a helmet's crown points forward out of the face, a cap sits on the cheek. This rig is +X-down-the-bone so the ENGINE bone frame has +X up the skull, while an equipment prefab is authored Unity Y-UP - the two differ by exactly the 90 degrees you see. Measured on the head bone at bind: engine +X and Blender +Y both map to world (0.00, -0.36, +0.93) |
+| hands solved onto the weapon after a cross-fade | leaving the raw local blend | the rifle floats out of the grip for the length of the fade - the left fist hangs in mid-air below the magwell and the gun hovers over a closed right hand. Peaks at 90-204 mm on this pack, and motion blur on a final render HIDES it, so it survives review and shows up in playback |
 | root motion stripped once | leaving it in the track AND moving the character | the body slides out from under the camera along the clip's own axis |
 | clip resolved by controller id, not name | resolving by name | you get the additive-DELTA twin of a clip and play its deltas as absolute poses; the character folds only in the states that happen to hit the duplicate |
 | joint weights sum to 1 | Unity's stored weights used raw | vertices drift slightly toward the origin - a soft shrink most visible at the extremities |
@@ -489,7 +587,7 @@ Anatomical validation (`extraction/characters/validate.py`) is the last line of 
 
 ---
 
-## 15. Old patterns
+## 16. Old patterns
 
 - **Hand-authored part lists.** `characters.json` used to carry hand-picked prefabs per character. Measured against the game, the authored scav was wrong: it wore `head_civilian_1`, which does not appear in the scav appearance table at all (the game rolls `wild_head_1/2/3/drozd/misha`), and it had no hands slot. Appearance is now rolled from the game's own weighted tables; `characters.json` survives for named one-offs and for the few facts the tables do not carry (the equipment slot→bone choice, controller overrides, clip sets).
 - **A per-clip rotation basis chosen by scoring.** An earlier revision decoded each clip twice - with and without an extra X flip on the rotation curves - and selected the better-scoring decode with a `validate.choose_basis` helper. Neither `choose_basis` nor `clips._curve_quat_to_transform` exists in the current source; the names appear only in prose (`README.md:164`, `validate.py:10`, `validate.py:168`). The present decoder applies `coords.quats` uniformly to quaternion curves and to euler-derived quaternions, with no per-clip choice; the apparent need for one was an artefact of a broken euler conversion scoring the two encodings against each other (`clips.py:393-395`).

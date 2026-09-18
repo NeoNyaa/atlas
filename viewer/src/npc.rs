@@ -220,6 +220,11 @@ fn spawn_npcs(
             return (!t.is_empty()).then(|| t.to_ascii_lowercase());
         }
         // Bare ids: only ones that are not the base/pmc/utility packs act as boss tokens.
+        // `assault_3` is a rolled SCAV, not a boss called "assault_3"; without this the pool ids
+        // become boss tokens and match any way whose name happens to contain them.
+        if stem.starts_with("assault") {
+            return None;
+        }
         (!matches!(stem, "scav" | "assault" | "player" | "pmcbear" | "pmcusec" | "pmc_bear" | "pmc_usec"))
             .then(|| stem.to_ascii_lowercase())
     };
@@ -261,6 +266,36 @@ fn spawn_npcs(
         })
         .and_then(|d| crate::character::weapon::load(&d, &mut meshes, &mut materials, &mut images));
 
+    // A CAST OF ONE LOOKS LIKE A CAST OF ONE. Every non-boss agent used to take pack 0, so a map
+    // with 24 scavs showed the same man 24 times - same face, same coat, same kit, because all of
+    // that is baked into a pack at build time and cannot vary per entity.
+    //
+    // `assault` is the scav bot type, and `build_character.py --bot assault --seed N` rolls BOTH
+    // the appearance (body/feet/hands/head, from the game's own weighted tables) and the kit. So a
+    // pool of `assault_<n>` packs is a cast of different men, and each agent takes one by index.
+    // Falls back to the base pack when none are built, which is the old behaviour exactly.
+    let mut scav_pool: Vec<usize> = Vec::new();
+    {
+        let mut ids: Vec<&String> = available
+            .iter()
+            .filter(|id| {
+                id.strip_prefix("assault_")
+                    .is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+            })
+            .collect();
+        ids.sort();
+        for id in ids {
+            if let Some(i) = ensure_pack(id, &mut packs, &mut pack_ids) {
+                scav_pool.push(i);
+            }
+        }
+    }
+    if scav_pool.is_empty() {
+        scav_pool.push(0);
+    }
+
+    // Separate from `n`, which the spawn closure borrows mutably.
+    let mut cast_seq = 0usize;
     let mut n = 0usize;
     let mut spawn_agent = |targets: Vec<Vec3>, ping_pong: bool, cast: usize,
                            packs: &Vec<Arc<CharacterPack>>,
@@ -311,6 +346,10 @@ fn spawn_npcs(
                 break;
             }
         }
+        if cast == 0 {
+            cast = scav_pool[cast_seq % scav_pool.len()];
+            cast_seq += 1;
+        }
         spawn_agent(route.points.clone(), true, cast, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
     }
     // One wanderer per core group with enough points to circulate; capped so big maps stay light.
@@ -318,24 +357,86 @@ fn spawn_npcs(
     let mut wanderers = 0usize;
     for pts in groups {
         if pts.len() >= 3 && wanderers < MAX_WANDERERS {
-            spawn_agent(pts, false, 0, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
+            let cast = scav_pool[cast_seq % scav_pool.len()];
+            cast_seq += 1;
+            spawn_agent(pts, false, cast, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
             wanderers += 1;
         }
     }
     // PMC bodies on the map's REAL raid starts: side=pmc spawn points whose categories include
     // `player` (the same rule nav_bake documents — the co-op/group masks are NOT raid starts),
     // grouped by the game's own infiltration zone. One body per zone cluster walks between that
-    // zone's spawn points, usec/bear alternating, capped like the wanderers.
+    // zone's spawn points, side drawn 50/50, capped like the wanderers.
+    //
+    // THIS IS THE ONLY AI PMC PATH. The character you play is spawned by `character::mod` from
+    // `EFT_CHARACTER` and never passes through here, so nothing below can change the player's side.
     const MAX_PMC: usize = 6;
+    // TWO SIDES DO NOT SHARE A CORNER OF THE MAP. The draw below is per cluster, and two clusters
+    // can sit close enough that a USEC and a BEAR end up patrolling the same yard - which reads as
+    // wrong immediately, because in game they would be shooting at each other. So a cluster within
+    // this distance of one already cast adopts ITS side instead of its own draw.
+    //
+    // 100 m is chosen to be larger than a cluster's own walkable spread and smaller than the gap
+    // between genuine infiltration zones, so it merges neighbours without collapsing the whole map
+    // onto one side. The draw still decides which side a NEIGHBOURHOOD is.
+    const MIN_SIDE_SEPARATION_M: f32 = 100.0;
+    let mut cast_sides: Vec<(Vec3, bool)> = Vec::new();
+    let mut side_adopted = 0usize;
+    let mut nearest_opposite = f32::INFINITY;
+    let mut side_adopted = 0usize;
+    let mut nearest_opposite = f32::INFINITY;
     let mut pmc_cast = 0usize;
     if forced.is_none() {
         let clusters = load_pmc_spawn_clusters(&pack.0.root);
-        for (ci, pts) in clusters.into_iter().enumerate() {
+        for pts in clusters.into_iter() {
             if pmc_cast >= MAX_PMC || pts.len() < 2 {
                 continue;
             }
-            let want = if ci % 2 == 0 { "pmcusec_0" } else { "pmcbear_0" };
-            let alt = if ci % 2 == 0 { "pmcbear_0" } else { "pmcusec_0" };
+            // A COIN FLIP, NOT AN ALTERNATION. `ci % 2` produced a perfect USEC/BEAR stripe:
+            // on six clusters exactly three of each, in the same order, on every map and every
+            // run. The game draws each PMC's side independently, so this draws too.
+            //
+            // SEEDED, not random. Every roll in this project is deterministic - appearance and
+            // loadout both seed from (bot type, index) so an NPC keeps its identity across a
+            // reload and across machines - and a side that reshuffled on every launch would break
+            // that for no benefit. The seed is the cluster's own first spawn point, quantised to
+            // the centimetre, so it is stable for a given map and independent between maps.
+            let seed = pts.first().copied().unwrap_or(Vec3::ZERO);
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for v in [seed.x, seed.y, seed.z] {
+                for b in ((v * 100.0).round() as i64).to_le_bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            let mut bear = h & 1 == 0;
+
+            // Adopt a near neighbour's side rather than standing an enemy next to him.
+            let centroid = pts.iter().copied().fold(Vec3::ZERO, |a, b| a + b) / pts.len() as f32;
+            if let Some((_, near_bear)) = cast_sides
+                .iter()
+                .filter(|(c, _)| c.distance(centroid) < MIN_SIDE_SEPARATION_M)
+                .min_by(|a, b| {
+                    a.0.distance(centroid)
+                        .total_cmp(&b.0.distance(centroid))
+                })
+            {
+                if *near_bear != bear {
+                    side_adopted += 1;
+                }
+                bear = *near_bear;
+            }
+            // Report the closest a USEC ends up to a BEAR, so the separation rule is checkable
+            // rather than assumed: if this ever prints below MIN_SIDE_SEPARATION_M the rule failed.
+            for (c, b) in &cast_sides {
+                if *b != bear {
+                    nearest_opposite = nearest_opposite.min(c.distance(centroid));
+                }
+            }
+            cast_sides.push((centroid, bear));
+
+            let want = if bear { "pmcbear_0" } else { "pmcusec_0" };
+            let alt = if bear { "pmcusec_0" } else { "pmcbear_0" };
             let Some(i) = ensure_pack(want, &mut packs, &mut pack_ids)
                 .or_else(|| ensure_pack(alt, &mut packs, &mut pack_ids))
             else {
@@ -344,6 +445,24 @@ fn spawn_npcs(
             spawn_agent(pts, false, i, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
             pmc_cast += 1;
         }
+    }
+    if pmc_cast > 0 {
+        info!(
+            "npc: AI PMC sides drawn 50/50 per spawn cluster — {} of {} adopted a neighbour's side              (within {:.0} m); closest opposing pair {:.0} m apart",
+            side_adopted,
+            pmc_cast,
+            MIN_SIDE_SEPARATION_M,
+            if nearest_opposite.is_finite() { nearest_opposite } else { -1.0 }
+        );
+    }
+    if pmc_cast > 0 {
+        info!(
+            "npc: AI PMC sides drawn 50/50 per spawn cluster - {} of {} adopted a neighbour's side              (within {:.0} m); closest opposing pair {:.0} m apart",
+            side_adopted,
+            pmc_cast,
+            MIN_SIDE_SEPARATION_M,
+            if nearest_opposite.is_finite() { nearest_opposite } else { -1.0 }
+        );
     }
     if let Some(w) = weapon {
         commands.insert_resource(NpcWeapon(std::sync::Arc::new(w)));

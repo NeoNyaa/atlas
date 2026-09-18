@@ -283,13 +283,12 @@ fn pick_system(
         let aff = inst.affine3a();
         let local_c = Vec3::new(s[0], s[1], s[2]);
         let wc = aff.transform_point3(local_c);
-        let m3 = aff.matrix3;
-        let cscale = m3
-            .x_axis
-            .length()
-            .max(m3.y_axis.length())
-            .max(m3.z_axis.length());
-        let wr = s[3] * cscale;
+        // MAX COLUMN NORM IS A LOWER BOUND, not a bound. `gpu_driven::conservative_radius_scale`
+        // documents it by name as the original culling bug: under shear a sphere can grow beyond
+        // the longest column, so the broadphase misses the instance entirely and the click passes
+        // through it. Sharing the GPU cull's own function keeps the two broadphases from
+        // disagreeing about what is on screen.
+        let wr = s[3] * crate::render::gpu_driven::conservative_radius_scale(Mat3::from(aff.matrix3));
         if let Some(t) = ray_sphere(ro, rd, wc, wr) {
             candidates.push((i, t));
         }

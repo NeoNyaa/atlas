@@ -268,12 +268,15 @@ def build(
         # {path, slot, view} from appearance.py. Both shapes read the same way.
         rel = entry["path"] if isinstance(entry, dict) else entry
         view = entry.get("view", "third") if isinstance(entry, dict) else "third"
+        # Equipment prefabs bundle rigid proxies alongside the worn renderer; body prefabs do not.
+        is_kit = isinstance(entry, dict) and entry.get("slot") in getattr(
+            __import__("kit_parts"), "WORN_SLOTS", ())
         print(f"[part] {rel}" + (f"  ({view}-person)" if view != "third" else ""))
         part_name = os.path.splitext(os.path.basename(rel))[0]
         try:
             res = skin_mod.load_part(
                 _resolve(rel), part_name, skel, material_base=len(materials), strict=strict,
-                lods=lod_filter
+                lods=lod_filter, skip_unskinned=is_kit, resolve_deps=True
             )
         except skin_mod.ForeignRigError as e:
             print(f"  [skip] {e}")
@@ -530,6 +533,22 @@ def main() -> None:
     ap.add_argument("--bot", help="bot type from the game's own tables (assault, pmcusec, "
                                   "bosskilla, ...) — appearance is ROLLED, not authored")
     ap.add_argument("--seed", type=int, default=0, help="roll seed for --bot (default 0)")
+    ap.add_argument("--kit", action="store_true",
+                    help="also roll the bot's EQUIPMENT from the game's own tables and fold it in: "
+                         "skinned items (armour, rig, backpack, balaclava) join the skinned parts "
+                         "so they deform with the body, rigid items (helmet, cap, goggles, headset) "
+                         "become bone-pinned attachments. See kit_parts.py")
+    ap.add_argument("--kit-bot", metavar="BOT",
+                    help="roll the kit from THIS bot's tables when building a named --character. "
+                         "characters.json entries are hand-specced and have no bot type of their "
+                         "own, so a scav built by name could never carry equipment; --kit-bot "
+                         "assault gives it the same table the rolled assault bot uses")
+    ap.add_argument("--skip-slot", action="append", default=[], metavar="SLOT",
+                    help="do not wear this kit slot at all, e.g. --skip-slot FaceCover")
+    ap.add_argument("--prefer", action="append", default=[], metavar="SLOT=SUBSTR[,SUBSTR]",
+                    help="bias a kit slot toward matching items, e.g. Headwear=head_bear. The "
+                         "weights stay the game's; this only restricts which of its own options "
+                         "are eligible, so nothing is invented")
     ap.add_argument("--controller", help="override the animator bundle (relative to the characters "
                                          "root). The BOT controllers carry no first-person aim -- "
                                          "bots have no first-person view -- so a character meant "
@@ -563,15 +582,63 @@ def main() -> None:
             spec["rootMotion"] = args.root_motion
         print(f"[appearance] {args.bot} #{args.seed}: "
               + ", ".join(f"{k}={v['name']}" for k, v in spec["appearance"].items()))
-        build(character=spec, clip_set=args.clips, skip_clips=args.skip_clips, lods=args.lod,
-              strict=not args.no_strict, out_dir=args.out)
+        if args.kit:
+            import kit_parts
+            prefer = {}
+            for p in args.prefer:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    prefer[k.strip()] = [x.strip() for x in v.split(",") if x.strip()]
+            kit_report = kit_parts.apply(spec, args.bot, args.seed, prefer=prefer or None,
+                                         skip_slots=set(args.skip_slot) or None)
+        out = build(character=spec, clip_set=args.clips, skip_clips=args.skip_clips,
+                    lods=args.lod, strict=not args.no_strict, out_dir=args.out)
+        if args.kit:
+            # WHICH SLOTS ARE FILLED decides which VARIANT of a garment is correct: the game ships
+            # a top per combination it can be worn under (`_AR_` with body armour, `_CR_` with a
+            # chest rig, `_CR_AR_` with both, base with neither) and they occupy the same space.
+            # A consumer cannot pick without knowing the kit, so the kit is recorded beside the
+            # pack rather than left to be guessed from mesh names.
+            import json as _json
+            _json.dump({"bot": args.bot, "seed": args.seed,
+                        "slots": sorted({r[0] for r in kit_report if r[2] != "skip"}),
+                        "items": [{"slot": r[0], "item": r[1], "kind": r[2]}
+                                  for r in kit_report if r[2] != "skip"]},
+                       open(os.path.join(out, "kit.json"), "w"), indent=1)
         return
 
     if not args.character:
         ap.error("--character, --bot or --list is required")
+    if args.kit and not args.kit_bot:
+        ap.error("--kit on a named --character needs --kit-bot <type> to say which table to roll")
 
     if args.dump_states:
         dump_states(args.character, args.grep)
+        return
+
+    if args.kit:
+        # A named character is a characters.json SPEC, not a rolled bot, so resolve it to a spec
+        # dict first and fold the kit into that - the builder consumes both shapes identically.
+        import kit_parts
+        reg = load_registry()
+        spec = dict(reg["characters"][args.character])
+        spec["id"] = args.character
+        spec.setdefault("clipSets", reg.get("clipSets") or {})
+        prefer = {}
+        for pf in args.prefer:
+            if "=" in pf:
+                k, v = pf.split("=", 1)
+                prefer[k.strip()] = [x.strip() for x in v.split(",") if x.strip()]
+        kit_report = kit_parts.apply(spec, args.kit_bot, args.seed, prefer=prefer or None,
+                                     skip_slots=set(args.skip_slot) or None)
+        out = build(character=spec, clip_set=args.clips, skip_clips=args.skip_clips,
+                    lods=args.lod, strict=not args.no_strict, out_dir=args.out)
+        import json as _json
+        _json.dump({"bot": args.kit_bot, "seed": args.seed,
+                    "slots": sorted({r[0] for r in kit_report if r[2] != "skip"}),
+                    "items": [{"slot": r[0], "item": r[1], "kind": r[2]}
+                              for r in kit_report if r[2] != "skip"]},
+                   open(os.path.join(out, "kit.json"), "w"), indent=1)
         return
 
     build(

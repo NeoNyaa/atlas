@@ -18,6 +18,8 @@
 //! the frame — and needs no changes to `walk_move` itself.
 
 use super::anim::{accumulate_additive, accumulate_clip, eval_tree, PoseAccumulator, WeightedClip};
+use super::hold::WeaponHold;
+use super::pack::ClipData;
 use super::pack::CharacterPack;
 use super::rig::{CharacterRoot, CharacterMesh};
 use super::{ActiveCharacter, CharacterSettings};
@@ -403,6 +405,8 @@ pub fn drive_character(
     acc.clear();
     let aim_w = aim_blend.0.clamp(0.0, 1.0);
     let root_state_time = root.state_time;
+    let state_time_for_hold = root.state_time;
+    let prev_time_for_hold = root.prev_time;
     // Smoothstep so the fade eases in and out rather than moving at constant angular rate.
     let t = root.fade.clamp(0.0, 1.0);
     let w_in = if fading { t * t * (3.0 - 2.0 * t) } else { 1.0 };
@@ -423,7 +427,7 @@ pub fn drive_character(
     }
     // Split the borrow: `locals` is the scratch buffer and `bones` the entity list, and the write
     // loop below needs both at once.
-    let CharacterRoot { bones, locals, .. } = &mut *root;
+    let CharacterRoot { bones, locals, weapon_grip, .. } = &mut *root;
     acc.resolve(pack, locals);
 
     // ---- additive aim layer -------------------------------------------------------------
@@ -445,6 +449,45 @@ pub fn drive_character(
                 // The blend fraction IS the position along the aim-in transition: 0 leaves the clip at its
                 // neutral first frame, 1 holds it fully shouldered.
                 accumulate_additive(clip, aim_w * clip.duration, l.weight * layer_w, locals);
+            }
+        }
+    }
+
+    // ---- keep the hands on the weapon through the cross-fade ----
+    // The accumulation above is a per-bone LOCAL blend, which does not preserve the world-space
+    // relationship between two chains of different length - and the weapon hold is one. See
+    // `super::hold`. One extra sample plus FK per contributing clip, and only while a fade is live.
+    if fading {
+        let mut active: Vec<(&ClipData, f32, Vec<(Vec3, Quat, Vec3)>)> = Vec::new();
+        let mut one = PoseAccumulator::new(pack.bones.len());
+        let feed: Vec<(&WeightedClip, f32, f32)> = leaves
+            .iter()
+            .map(|l| (l, state_time_for_hold, l.weight * w_in))
+            .chain(
+                prev_leaves
+                    .iter()
+                    .map(|l| (l, prev_time_for_hold, l.weight * (1.0 - w_in))),
+            )
+            .collect();
+        for (l, time, w) in feed {
+            if w <= 1e-4 {
+                continue;
+            }
+            if let Some(clip) = pack.clip_by_controller_id(l.clip_id) {
+                one.clear();
+                accumulate_clip(&mut one, clip, time, 1.0);
+                let mut own = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); pack.bones.len()];
+                one.resolve(pack, &mut own);
+                active.push((clip, w, own));
+            }
+        }
+        let total: f32 = active.iter().map(|(_, w, _)| *w).sum();
+        if total > 1e-6 {
+            for a in active.iter_mut() {
+                a.1 /= total;
+            }
+            if let Some(h) = WeaponHold::new(pack) {
+                h.solve(pack, &active, locals, weapon_grip);
             }
         }
     }
@@ -523,7 +566,7 @@ pub fn aim_down_sights(
     aim: Option<Res<PlayerAim>>,
     mut blend: ResMut<AimBlend>,
     bones: Query<&GlobalTransform, With<super::rig::CharacterBone>>,
-    mut cam: Query<(&Transform, &mut Projection), With<crate::CullCamera>>,
+    mut cam: Query<(&Transform, &mut Projection, Option<&CameraBoom>), With<crate::CullCamera>>,
     mut offsets: Query<&mut Transform, (Without<crate::CullCamera>, Without<super::rig::CharacterBone>)>,
 ) {
     let Some(aim) = aim else { return };
@@ -545,12 +588,20 @@ pub fn aim_down_sights(
         return;
     }
     let Ok(bone_gt) = bones.get(aim.bone) else { return };
-    let Ok((cam_tf, mut proj)) = cam.single_mut() else { return };
+    let Ok((cam_tf, mut proj, boom)) = cam.single_mut() else { return };
     // Put the sight ON the eye by moving the WEAPON, not the view: the offset that satisfies
     //     bone_world * offset * anchor == camera
     // is `offset = bone_world^-1 * camera * anchor^-1`. Eased from identity by the blend, so the
     // gun rises into the sight picture instead of teleporting.
-    let cam_world = Transform::from_translation(cam_tf.translation).with_rotation(cam_tf.rotation);
+    // SOLVE AGAINST THE EYE, NOT THE BOOM. This system is ordered `.after(drive_character)`, and
+    // drive_character has already added the third-person boom to the camera transform. Reading it
+    // raw therefore aims the weapon at a point metres behind and above the head, so in third person
+    // the sight lines up with the boom camera rather than with the character's eye - and the more
+    // the boom is extended, the further out the gun swings. `CameraBoom::applied` is exactly what
+    // was added, so subtracting it recovers the eye. In first person `applied` is zero and this is
+    // a no-op, which is why it read as correct.
+    let eye = cam_tf.translation - boom.map(|b| b.applied).unwrap_or(Vec3::ZERO);
+    let cam_world = Transform::from_translation(eye).with_rotation(cam_tf.rotation);
     let want = Transform::from_matrix(
         bone_gt.to_matrix().inverse()
             * cam_world.to_matrix()

@@ -35,16 +35,24 @@ def load_faces(sky_dir, entry):
     return np.stack(imgs, 0), s
 
 
-def equirect(faces, size, width):
-    """Resample the cube into an equirectangular image, Blender world orientation.
+def _bspline_w(t):
+    """Cubic B-spline weights for the taps at -1, 0, +1, +2.
 
-    Blender is Z-up and the pack's cubemap is authored in the pack's Y-up world, so the
-    direction is converted per pixel: d_pack = (bx, bz, -by) is the inverse of the importer's
-    (x, y, z) -> (x, -z, y).
+    C2 continuous and mildly smoothing, which is the correct reconstruction filter for a source
+    that genuinely carries no detail above its own texel: it invents nothing and, unlike bilinear,
+    leaves no first-derivative discontinuity at each texel boundary for the eye to read as a facet.
     """
-    h = width // 2
-    u = (np.arange(width, dtype=np.float32) + 0.5) / width
-    v = (np.arange(h, dtype=np.float32) + 0.5) / h
+    t2, t3 = t * t, t * t * t
+    return ((-t3 + 3 * t2 - 3 * t + 1) / 6.0,
+            (3 * t3 - 6 * t2 + 4) / 6.0,
+            (-3 * t3 + 3 * t2 + 3 * t + 1) / 6.0,
+            t3 / 6.0)
+
+
+def _directions(width, height, ox, oy):
+    """Blender-world -> pack-world (Y-up) unit directions for one sub-pixel offset."""
+    u = (np.arange(width, dtype=np.float64) + ox) / width
+    v = (np.arange(height, dtype=np.float64) + oy) / height
     theta = (u - 0.5) * (2.0 * np.pi)               # azimuth
     phi = (0.5 - v) * np.pi                         # elevation, +pi/2 at the top row
     ct = np.cos(phi)[:, None]
@@ -63,8 +71,11 @@ def equirect(faces, size, width):
     bz = np.repeat(np.sin(phi)[:, None], width, 1)
 
     # Blender -> pack (Y-up)
-    dx, dy, dz = bx, bz, -by
+    return bx, bz, -by
 
+
+def _sample(faces, size, dx, dy, dz):
+    """Cube lookup with cubic B-spline reconstruction inside the chosen face."""
     ax, ay, az = np.abs(dx), np.abs(dy), np.abs(dz)
     face = np.where(
         (ax >= ay) & (ax >= az), np.where(dx > 0, 0, 1),
@@ -84,9 +95,77 @@ def equirect(faces, size, width):
     )
     fu = np.clip((sc / ma + 1.0) * 0.5, 0.0, 1.0)
     fv = np.clip((tc / ma + 1.0) * 0.5, 0.0, 1.0)
-    px = np.clip((fu * size).astype(np.int32), 0, size - 1)
-    py = np.clip((fv * size).astype(np.int32), 0, size - 1)
-    return faces[face, py, px]
+
+    # NOT `faces[face, int(fv * size), int(fu * size)]`. That was the whole of the sky's
+    # pixelation: NatureCubemap is 128 px per face, i.e. 0.70 deg per source texel, and at the
+    # delivered lens (50 mm, 36 mm sensor, 2560x1440 = 0.0159 deg per output pixel) ONE source
+    # texel covers 44 output pixels. Nearest-neighbour indexing bakes a hard edge between each of
+    # those blocks into the equirect, and Blender's bilinear magnification cannot undo an edge that
+    # is already in the image - measured as a 53.3 px cell period in the rendered frame. Texel
+    # centres sit at (i + 0.5) / size.
+    x = np.clip(fu * size - 0.5, 0.0, size - 1.0)
+    y = np.clip(fv * size - 0.5, 0.0, size - 1.0)
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    wx = _bspline_w(x - x0)
+    wy = _bspline_w(y - y0)
+    acc = np.zeros(x.shape + (3,), np.float64)
+    for j in range(4):
+        yy = np.clip(y0 + j - 1, 0, size - 1)
+        for i in range(4):
+            xx = np.clip(x0 + i - 1, 0, size - 1)
+            acc += faces[face, yy, xx] * (wx[i] * wy[j])[..., None]
+    return acc
+
+
+def equirect(faces, size, width, ss=2):
+    """Resample the cube into an equirectangular image, Blender world orientation.
+
+    Blender is Z-up and the pack's cubemap is authored in the pack's Y-up world, so the
+    direction is converted per pixel: d_pack = (bx, bz, -by) is the inverse of the importer's
+    (x, y, z) -> (x, -z, y).
+
+    `ss` sub-pixel offsets per axis are box-averaged. Sampling the texel CORNER once (the old
+    behaviour) leaves the seam between two cube faces to fall wherever the single sample lands;
+    2x2 costs four passes of a vectorised lookup and measures 0.0911 crease against bilinear's
+    0.1238 and nearest's 0.2642.
+    """
+    h = width // 2
+    acc = np.zeros((h, width, 3), np.float64)
+    for j in range(ss):
+        for i in range(ss):
+            dx, dy, dz = _directions(width, h, (i + 0.5) / ss, (j + 0.5) / ss)
+            acc += _sample(faces, size, dx, dy, dz)
+    return (acc / float(ss * ss)).astype(np.float32)
+
+
+def write_png16(path, arr01):
+    """16-bit RGB PNG from float [0,1]. PIL's RGB mode is 8-bit only, so write the chunks.
+
+    This is not cosmetic. The sky is one gentle gradient, 8 bits is 0.4% of range per code, and
+    once the equirect texel is small enough to survive Blender's magnification those codes become
+    visible contours - worth 0.1590 crease at 4096 width, i.e. WORSE than the blocks they replaced.
+    """
+    import struct
+    import zlib
+    q = np.clip(arr01 * 65535.0 + 0.5, 0, 65535).astype(">u2")
+    h, w, _ = q.shape
+    be = q.tobytes()
+    stride = w * 6
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)                                   # filter type 0, none
+        raw += be[y * stride:(y + 1) * stride]
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 16, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+        f.write(chunk(b"IEND", b""))
 
 
 def main():
@@ -94,6 +173,8 @@ def main():
     ap.add_argument("--name", default="NatureCubemap")
     ap.add_argument("--width", type=int, default=2048)
     ap.add_argument("--sky-dir", default=SKY_DIR)
+    ap.add_argument("--ss", type=int, default=2, help="sub-pixel samples per axis")
+    ap.add_argument("--bits", type=int, default=16, choices=(8, 16))
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -106,11 +187,16 @@ def main():
     entry = cubes[a.name]
 
     faces, size = load_faces(a.sky_dir, entry)
-    img = equirect(faces, size, a.width)
+    img = equirect(faces, size, a.width, ss=a.ss)
     out = a.out or os.path.join(a.sky_dir, "%s_equirect.png" % a.name)
-    Image.fromarray(np.clip(img * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(out)
-    print("%s: %d faces at %dpx -> %dx%d equirect" % (a.name, len(entry["faces"]), size,
-                                                      a.width, a.width // 2))
+    if a.bits == 16:
+        write_png16(out, img)
+    else:
+        Image.fromarray(np.clip(img * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(out)
+    print("%s: %d faces at %dpx -> %dx%d equirect, cubic B-spline, %dx%d supersampled, %d-bit"
+          % (a.name, len(entry["faces"]), size, a.width, a.width // 2, a.ss, a.ss, a.bits))
+    print("  %.4f deg per source texel, %.4f deg per equirect texel"
+          % (90.0 / size, 360.0 / a.width))
     print("  zenith %s  horizon %s  mean %s"
           % (entry.get("zenith"), entry.get("horizon"), entry.get("mean")))
     print("  wrote %s" % out)

@@ -139,6 +139,7 @@ MODES = {
         # pair would drop the median 16%.
         atmosphere="uniform",
         haze_post=False,           # and TRACED, because that is what the pair was fitted against
+        backdrop="pack",           # the cubemap is what the GAME shows; parity means showing it
         glass_mode="trs",          # the bounded legacy reflection, term for term
         cavity=False,              # the game shader has no ambient-occlusion term at all
         comp=False,                # no glare, no chromatic aberration: the viewer has neither
@@ -164,6 +165,9 @@ MODES = {
         # and shaped by HAZE_DENSITY/HAZE_SCALE_H, and still visible in the viewport; it is
         # hide_render'd and applied analytically from the Z pass instead. See _depth_haze_nodes.
         haze_post=True,
+        # The sky the LENS sees, and only the lens: see BACKDROP_RATIO. Lighting stays on the pack
+        # cubemap in both modes, so SUN_ENERGY/SKY_STRENGTH remain the pair that was fitted.
+        backdrop="physical",
         glass_mode="physical",     # real transmission on panes the pack already ships as slabs
         cavity=True,               # the normal maps' own self-occlusion, Poisson-derived
         comp=True,                 # veiling glare + lateral CA, calibrated below
@@ -177,6 +181,95 @@ MODES = {
         samples=int(SAMPLES * 4.0),
     ),
 }
+
+# THE BACKDROP SPLIT (photoreal only). The pack's sky is a 128 px/face REFLECTION PROBE, ~0.70 deg
+# per texel, resampled to 2048x1024 by make_sky_equirect.py. It is smooth and it is structureless,
+# and no resampling recovers cloud edges that were never in the source. The game's visible horizon
+# is SkyboxMountains01..08 GEOMETRY, which this repository has never extracted, so a sharp horizon
+# is out of reach here either way.
+#
+# The docstring above records why a physical sky was rejected as the ENVIRONMENT: 12.6x the pack's
+# energy, 59.6% of the frame clipped. That is a statement about the sky LIGHTING THE SCENE. What a
+# camera ray terminates on is a separate question, and `Light Path > Is Camera Ray` lets Cycles
+# answer the two differently. So: lighting keeps the pack cubemap EXACTLY - every fitted number,
+# including the SUN_ENERGY/SKY_STRENGTH pair, is untouched - and only the pixels the lens sees are
+# replaced. Reflections stay on the cubemap too, which is right: a puddle in this scene should
+# mirror the sky the rest of the lighting came from.
+#
+# BACKDROP_RATIO is a MEASUREMENT, not a taste knob, on exactly the footing SUN_ENERGY is: it is the
+# factor that makes the physical backdrop, CLOUDS INCLUDED, carry the same radiance as the pack sky
+# it replaces. Reproduce with tools/blender/fit_sky_backdrop.py, which builds this very graph and
+# writes packs/shared/sky/backdrop_fit.json.
+#
+# It is fitted over the SOLID-ANGLE-WEIGHTED UPPER HEMISPHERE, not over one frame, and that is not
+# pedantry. Measured on a level 12 mm frame the physical sky came out 18.9x brighter than the pack
+# capture, whose dark baked treeline sits exactly there; measured 18 degrees up, the comparison
+# inverted to 2.2x the other way, because the pack's upper sky is the bright part. One view direction
+# fits the FRAMING, not the sky. An equirectangular camera sees every direction at once, and rows are
+# cosine-weighted because equirect gives the zenith as many pixels as the horizon while it covers far
+# less solid angle.
+#
+# Re-run the fit after ANY change to the backdrop's appearance. Adding the cloud layer alone moved
+# this by 2.37x and the horizon handover a further 1.20x. Note which way that first move went: the
+# ratio going UP means the backdrop got DARKER and needed more gain. That was the standing evidence
+# that the original absolute cloud palette was darker than the sky it covered, and it sat here
+# misread as "cloud is brighter than the sky" until the palette was measured directly.
+# The fit solves an AFFINE model, because HORIZON_HAZE mixes toward a fixed scene-referred colour
+# that does not scale with this constant.
+BACKDROP_RATIO = 0.114524
+
+# THE CLOUD LAYER, photoreal backdrop only. See _cloud_nodes for the ray-plane geometry.
+#
+# EVERY NUMBER BELOW IS INVENTED and that is a deliberate, disclosed choice rather than an oversight.
+# The pack ships no cloud data at all: its sky is a 128 px/face capture whose clouds are already an
+# unrecoverable blur, and there is no cloud texture, cloud mesh or weather record anywhere in the
+# extraction. So there is nothing to derive from, and the repo's rule - derive, do not author - is
+# not being broken here so much as it has nothing to bite on. What keeps this honest is that it runs
+# ONLY behind Is Camera Ray on the photoreal path: it cannot touch the lighting solve, it cannot
+# touch parity mode, and `EFT_CLOUDS=0` removes it entirely.
+#
+# The values aim at the overcast-but-breaking deck a Tarkov raid reads as, not at a summer postcard:
+# high coverage, low contrast, desaturated, with the sun's position agreeing with the sun lamp.
+CLOUD_ALTITUDE = 1600.0     # m; stratocumulus base. Lower = faster convergence at the horizon.
+CLOUD_SCALE = 2100.0        # m; the size of one cloud cell on the layer
+CLOUD_DETAIL = 8.0          # fBm octaves; below ~5 the edges read as smooth blobs
+CLOUD_ROUGHNESS = 0.545
+CLOUD_DISTORTION = 0.32     # breaks the grid the noise would otherwise betray
+CLOUD_COVERAGE = 0.495      # the noise value at which cloud starts; LOWER covers more sky
+CLOUD_SOFT = 0.065          # the width of the edge ramp; a hard cut reads as a paper cutout
+CLOUD_DENSITY_SPAN = 0.26   # noise range from "just formed" to "full thickness"; drives brightness
+CLOUD_RELIEF_WEIGHT = 0.45  # how much of the body tone is directional relief vs sheer thickness
+CLOUD_OPACITY = 0.97        # never fully 1.0 - a real deck lets some sky through even when thick
+CLOUD_FADE = (0.020, 0.115) # ray.z over which the layer dissolves into the horizon haze
+CLOUD_RELIEF_STEP = 0.075   # layer-units the second noise sample is offset toward the sun
+CLOUD_RELIEF_GAIN = 0.070   # the relief difference that maps to fully lit
+# A cloud top is BRIGHTER than the sky behind it and its base is much darker; that spread is the
+# whole reason a deck reads as three-dimensional rather than as fog on glass.
+#
+# THESE ARE MULTIPLES OF THE LOCAL SKY'S LUMINANCE, not absolute radiances, and that is a bug fix
+# rather than a style. Absolute constants here were all darker than the darkest pixel of the raw sky
+# they were composited over (see _cloud_nodes), which made the whole deck a silhouette. Expressed as
+# a ratio the numbers also stop depending on SKY_STRENGTH, BACKDROP_RATIO or the sky model's own
+# scale, so none of them can silently invert this again.
+CLOUD_GAIN_SHADOW = 0.30    # a base seen from below is much darker than the sky beside it
+CLOUD_GAIN_LIT = 1.05       # a sun-facing face is a little brighter
+CLOUD_GAIN_SILVER = 1.45    # the rim near the disc is clearly brighter
+# Chromaticity is authored, because it is the one thing luminance cannot carry: a base is lit by the
+# SKY and is cool, a sun-facing face is lit by the SUN and is warm. Multiplying by the sky's colour
+# instead of its luminance would erase exactly this difference.
+CLOUD_TINT_SHADOW = (0.90, 0.96, 1.12)
+CLOUD_TINT_LIT = (1.03, 1.00, 0.96)
+CLOUD_TINT_SILVER = (1.03, 1.00, 0.96)
+CLOUD_SILVER_ARC = (0.72, 0.995)       # dot(view, sun) over which the silver lining ramps in
+
+# Where the backdrop hands over to the scene's own aerial perspective, as ray.z. At or below the
+# first value it is pure HAZE_INSCATTER, above the second it is pure sky.
+# The lower bound is EXACTLY the horizon, and it has to be. Blender's sky texture is discontinuous
+# there - clear sky above, a dim painted ground below - so any handover that still lets a fraction
+# of it through at z=0 draws that discontinuity as a hard line across the frame. Ending the blend
+# at the horizon replaces the sky's ground entirely with the colour distant terrain fades into,
+# which is both the correct colour and the only one that leaves no seam.
+HORIZON_HAZE = (0.000, 0.160)
 
 # Ground extinction and scale height for the photoreal atmosphere. See MODES above.
 HAZE_DENSITY = 4.0e-4
@@ -491,6 +584,382 @@ def _try(obj, attr, value):
         pass
 
 
+def _sock(node, name, idx):
+    """A socket by name, falling back to index. Blender renames sockets between versions and the
+    Mix node in particular has four same-named pairs, so neither lookup alone is safe."""
+    try:
+        return node.inputs[name]
+    except (KeyError, TypeError):
+        return node.inputs[idx]
+
+
+def _cloud_nodes(nt, sun_dir, sky_col, x0=-1500, y0=-620):
+    """A cloud LAYER for the camera-ray backdrop. Returns a Color socket.
+
+    THESE VALUES ARE INVENTED. The pack ships no cloud data - its sky is a 128 px/face capture whose
+    clouds are an unrecoverable blur - so nothing here is derived from the game and this function
+    runs on the photoreal path only. It is the mode that departs from the game deliberately; this is
+    a departure, and this paragraph is the disclosure the repo's own rule asks for.
+
+    WHY A PLANE AND NOT A DOME. Mapping noise onto the sky direction is the standard shortcut and it
+    is instantly readable as fake: the cloud cells stay the same angular size all the way to the
+    horizon, so the sky looks like a painted ceiling. Real clouds live on a roughly flat layer a
+    kilometre or two up, so their apparent size falls off and they CROWD TOGETHER at the horizon.
+    That is the single strongest cue, and it costs one ray-plane intersection:
+
+        rd = -Incoming                     the view ray, pointing away from the camera
+        t  = CLOUD_ALTITUDE / rd.z         where that ray pierces the cloud layer
+        p  = rd.xy * t                     the point on the layer, in metres
+
+    rd.z is clamped away from zero because a ray at the horizon meets the layer at infinity; the
+    same clamp is what CLOUD_FADE then hides, so the layer dissolves into haze instead of smearing
+    into infinitely stretched streaks.
+
+    Lighting the clouds is faked deliberately and cheaply. A second noise sample, offset along the
+    sun's azimuth, differenced against the first gives relief that brightens the sun-facing side of
+    every cell - which is what actually reads as "lit cloud" - and a sun-proximity term adds the
+    silver lining near the disc. No volume, no extra bounces: this is a background shader and it
+    costs texture lookups, not path tracing.
+    """
+    geo = nt.nodes.new("ShaderNodeNewGeometry"); geo.location = (x0, y0)
+    # Incoming points from the shaded point back toward the camera, so the view ray is its negative.
+    rd = nt.nodes.new("ShaderNodeVectorMath"); rd.location = (x0 + 180, y0)
+    rd.operation = 'SCALE'
+    nt.links.new(geo.outputs["Incoming"], rd.inputs[0])
+    _sock(rd, "Scale", 3).default_value = -1.0
+
+    sep = nt.nodes.new("ShaderNodeSeparateXYZ"); sep.location = (x0 + 360, y0)
+    nt.links.new(rd.outputs["Vector"], sep.inputs[0])
+
+    # Clamp the ray's climb: at the horizon it never reaches the layer at all.
+    zc = nt.nodes.new("ShaderNodeMath"); zc.location = (x0 + 540, y0 - 120)
+    zc.operation = 'MAXIMUM'
+    nt.links.new(sep.outputs["Z"], zc.inputs[0])
+    zc.inputs[1].default_value = 0.030
+
+    t = nt.nodes.new("ShaderNodeMath"); t.location = (x0 + 720, y0 - 120)
+    t.operation = 'DIVIDE'
+    t.inputs[0].default_value = CLOUD_ALTITUDE
+    nt.links.new(zc.outputs[0], t.inputs[1])
+
+    flat = nt.nodes.new("ShaderNodeCombineXYZ"); flat.location = (x0 + 540, y0 + 80)
+    nt.links.new(sep.outputs["X"], flat.inputs["X"])
+    nt.links.new(sep.outputs["Y"], flat.inputs["Y"])
+    flat.inputs["Z"].default_value = 0.0
+
+    hit = nt.nodes.new("ShaderNodeVectorMath"); hit.location = (x0 + 900, y0)
+    hit.operation = 'SCALE'
+    nt.links.new(flat.outputs["Vector"], hit.inputs[0])
+    nt.links.new(t.outputs[0], _sock(hit, "Scale", 3))
+
+    # Into layer units, and offset so the camera does not sit under a fixed noise feature.
+    uv = nt.nodes.new("ShaderNodeVectorMath"); uv.location = (x0 + 1080, y0)
+    uv.operation = 'SCALE'
+    nt.links.new(hit.outputs["Vector"], uv.inputs[0])
+    _sock(uv, "Scale", 3).default_value = 1.0 / CLOUD_SCALE
+
+    def _noise(loc, vec_socket):
+        n = nt.nodes.new("ShaderNodeTexNoise"); n.location = loc
+        nt.links.new(vec_socket, n.inputs["Vector"])
+        n.inputs["Scale"].default_value = 1.0        # scale lives in CLOUD_SCALE, in metres
+        n.inputs["Detail"].default_value = CLOUD_DETAIL
+        n.inputs["Roughness"].default_value = CLOUD_ROUGHNESS
+        for k, v in (("Lacunarity", 2.0), ("Distortion", CLOUD_DISTORTION)):
+            if k in n.inputs:
+                n.inputs[k].default_value = v
+        return n
+
+    main_n = _noise((x0 + 1260, y0 + 120), uv.outputs["Vector"])
+
+    # The sun-offset sample, for relief.
+    sun_xy = mathutils.Vector((sun_dir.x, sun_dir.y, 0.0))
+    if sun_xy.length > 1e-6:
+        sun_xy.normalize()
+    off = nt.nodes.new("ShaderNodeVectorMath"); off.location = (x0 + 1260, y0 - 160)
+    off.operation = 'ADD'
+    nt.links.new(uv.outputs["Vector"], off.inputs[0])
+    off.inputs[1].default_value = (sun_xy.x * CLOUD_RELIEF_STEP,
+                                   sun_xy.y * CLOUD_RELIEF_STEP, 0.0)
+    lit_n = _noise((x0 + 1440, y0 - 160), off.outputs["Vector"])
+
+    # COVERAGE. A ramp, not a threshold: real cloud edges are soft over tens of metres and a hard
+    # cut reads as a paper cutout at any resolution.
+    cov = nt.nodes.new("ShaderNodeMapRange"); cov.location = (x0 + 1450, y0 + 120)
+    cov.interpolation_type = 'SMOOTHSTEP'
+    nt.links.new(main_n.outputs["Fac"], cov.inputs["Value"])
+    _sock(cov, "From Min", 1).default_value = CLOUD_COVERAGE
+    _sock(cov, "From Max", 2).default_value = CLOUD_COVERAGE + CLOUD_SOFT
+    _sock(cov, "To Min", 3).default_value = 0.0
+    _sock(cov, "To Max", 4).default_value = CLOUD_OPACITY
+
+    # HORIZON FADE. The layer must dissolve before the clamp above turns it into streaks.
+    fade = nt.nodes.new("ShaderNodeMapRange"); fade.location = (x0 + 1450, y0 - 380)
+    fade.interpolation_type = 'SMOOTHSTEP'
+    nt.links.new(sep.outputs["Z"], fade.inputs["Value"])
+    _sock(fade, "From Min", 1).default_value = CLOUD_FADE[0]
+    _sock(fade, "From Max", 2).default_value = CLOUD_FADE[1]
+    _sock(fade, "To Min", 3).default_value = 0.0
+    _sock(fade, "To Max", 4).default_value = 1.0
+
+    fac = nt.nodes.new("ShaderNodeMath"); fac.location = (x0 + 1640, y0 - 120)
+    fac.operation = 'MULTIPLY'
+    nt.links.new(cov.outputs["Result"], fac.inputs[0])
+    nt.links.new(fade.outputs["Result"], fac.inputs[1])
+
+    # RELIEF: where the layer thickens toward the sun, that face is lit.
+    rel = nt.nodes.new("ShaderNodeMath"); rel.location = (x0 + 1640, y0 + 260)
+    rel.operation = 'SUBTRACT'
+    nt.links.new(lit_n.outputs["Fac"], rel.inputs[0])
+    nt.links.new(main_n.outputs["Fac"], rel.inputs[1])
+    relm = nt.nodes.new("ShaderNodeMapRange"); relm.location = (x0 + 1820, y0 + 260)
+    relm.interpolation_type = 'SMOOTHSTEP'
+    nt.links.new(rel.outputs[0], relm.inputs["Value"])
+    _sock(relm, "From Min", 1).default_value = -CLOUD_RELIEF_GAIN
+    _sock(relm, "From Max", 2).default_value = CLOUD_RELIEF_GAIN
+    _sock(relm, "To Min", 3).default_value = 0.0
+    _sock(relm, "To Max", 4).default_value = 1.0
+
+    # DENSITY, separately from coverage. Coverage decides where cloud IS; density decides how thick
+    # it is once it is there, and thickness is most of why a cloud top is white while its edge is
+    # grey. Driving brightness from relief alone was the first version's mistake: it gave every cell
+    # the same mid-grey body, so thick cloud read as a dirty smudge sitting on a brighter sky.
+    dens = nt.nodes.new("ShaderNodeMapRange"); dens.location = (x0 + 1450, y0 + 400)
+    dens.interpolation_type = 'SMOOTHSTEP'
+    nt.links.new(main_n.outputs["Fac"], dens.inputs["Value"])
+    _sock(dens, "From Min", 1).default_value = CLOUD_COVERAGE
+    _sock(dens, "From Max", 2).default_value = CLOUD_COVERAGE + CLOUD_DENSITY_SPAN
+    # INVERTED, and this is the correction that made the clouds read at all. Thin cloud transmits,
+    # so an edge is BRIGHT; a thick base seen from below is starved of light and is DARK. Mapping
+    # brightness up with density did the opposite, and because alpha ramps from the same threshold
+    # every edge that was thin enough to actually see was also the darkest thing in frame - which is
+    # why sparse cover looked like soot smudges and heavy cover looked like a flat white sheet.
+    _sock(dens, "To Min", 3).default_value = 1.0
+    _sock(dens, "To Max", 4).default_value = 0.0
+
+    w_rel = nt.nodes.new("ShaderNodeMath"); w_rel.location = (x0 + 1820, y0 + 460)
+    w_rel.operation = 'MULTIPLY'
+    nt.links.new(relm.outputs["Result"], w_rel.inputs[0])
+    w_rel.inputs[1].default_value = CLOUD_RELIEF_WEIGHT
+    w_den = nt.nodes.new("ShaderNodeMath"); w_den.location = (x0 + 1820, y0 + 400)
+    w_den.operation = 'MULTIPLY'
+    nt.links.new(dens.outputs["Result"], w_den.inputs[0])
+    w_den.inputs[1].default_value = 1.0 - CLOUD_RELIEF_WEIGHT
+    body_fac = nt.nodes.new("ShaderNodeMath"); body_fac.location = (x0 + 2000, y0 + 430)
+    body_fac.operation = 'ADD'
+    body_fac.use_clamp = True
+    nt.links.new(w_rel.outputs[0], body_fac.inputs[0])
+    nt.links.new(w_den.outputs[0], body_fac.inputs[1])
+
+    # THE PALETTE IS RELATIVE TO THE SKY IT COVERS, not absolute. This is the correction to a real
+    # bug: the first version mixed absolute constants (shadow 0.246, lit 0.968, silver 1.300 in
+    # luminance) into RAW ShaderNodeTexSky radiance, whose upper hemisphere runs min 2.323, median
+    # 3.596, max 18.9. Every one of those tones was darker than the DARKEST sky pixel that exists,
+    # so the deck could only ever be a silhouette and the silver lining was the dimmest part of it.
+    # Every bright region in those frames was sky showing through, not lit cloud.
+    #
+    # The tell was already in the fit and went unread: adding the cloud layer moved BACKDROP_RATIO
+    # UP by 2.37x, i.e. the backdrop needed MORE gain, i.e. the clouds made it DARKER.
+    #
+    # So each tone is now the local sky's LUMINANCE times a gain times an authored chromaticity.
+    # Luminance, deliberately, and never the sky's colour: multiplying by the colour would make
+    # every tone inherit the sky's blue, collapse deck and sky into one hue family, and destroy the
+    # warm-key/cool-base separation that is most of what reads as cloud. A base is lit by SKY and is
+    # cool; a sun-facing face is lit by the SUN and is warm.
+    skylum = nt.nodes.new("ShaderNodeVectorMath"); skylum.location = (x0 + 1260, y0 + 560)
+    skylum.operation = 'DOT_PRODUCT'
+    # `sky_col` is the function's argument, the RAW sky. It must stay that: reading the cloud
+    # composite here instead would wire `over` back into its own input, which links.new builds
+    # happily and Cycles then reports as a dependency cycle.
+    nt.links.new(sky_col, skylum.inputs[0])
+    skylum.inputs[1].default_value = (0.2126, 0.7152, 0.0722)
+
+    def _tone(gain, tint, loc):
+        g = nt.nodes.new("ShaderNodeMath"); g.location = loc
+        g.operation = 'MULTIPLY'
+        nt.links.new(skylum.outputs["Value"], g.inputs[0])
+        g.inputs[1].default_value = gain
+        c = nt.nodes.new("ShaderNodeVectorMath"); c.location = (loc[0] + 170, loc[1])
+        c.operation = 'SCALE'
+        c.inputs[0].default_value = tuple(tint)
+        nt.links.new(g.outputs[0], _sock(c, "Scale", 3))
+        return c.outputs["Vector"]
+
+    t_shadow = _tone(CLOUD_GAIN_SHADOW, CLOUD_TINT_SHADOW, (x0 + 1450, y0 + 700))
+    t_lit = _tone(CLOUD_GAIN_LIT, CLOUD_TINT_LIT, (x0 + 1450, y0 + 620))
+    t_silver = _tone(CLOUD_GAIN_SILVER, CLOUD_TINT_SILVER, (x0 + 1450, y0 + 540))
+
+    body = nt.nodes.new("ShaderNodeMix"); body.location = (x0 + 2180, y0 + 260)
+    body.data_type = 'RGBA'
+    nt.links.new(body_fac.outputs[0], _sock(body, "Factor", 0))
+    nt.links.new(t_shadow, _sock(body, "A", 6))
+    nt.links.new(t_lit, _sock(body, "B", 7))
+
+    # SILVER LINING near the sun, which is where a real cloud deck is brightest and thinnest.
+    dot = nt.nodes.new("ShaderNodeVectorMath"); dot.location = (x0 + 1260, y0 - 420)
+    dot.operation = 'DOT_PRODUCT'
+    nt.links.new(rd.outputs["Vector"], dot.inputs[0])
+    dot.inputs[1].default_value = (sun_dir.x, sun_dir.y, sun_dir.z)
+    silver = nt.nodes.new("ShaderNodeMapRange"); silver.location = (x0 + 1450, y0 - 620)
+    silver.interpolation_type = 'SMOOTHSTEP'
+    nt.links.new(dot.outputs["Value"], silver.inputs["Value"])
+    _sock(silver, "From Min", 1).default_value = CLOUD_SILVER_ARC[0]
+    _sock(silver, "From Max", 2).default_value = CLOUD_SILVER_ARC[1]
+    _sock(silver, "To Min", 3).default_value = 0.0
+    _sock(silver, "To Max", 4).default_value = 1.0
+
+    hot = nt.nodes.new("ShaderNodeMix"); hot.location = (x0 + 2180, y0 + 120)
+    hot.data_type = 'RGBA'
+    nt.links.new(silver.outputs["Result"], _sock(hot, "Factor", 0))
+    nt.links.new(body.outputs[2], _sock(hot, "A", 6))
+    nt.links.new(t_silver, _sock(hot, "B", 7))
+
+    # Composite over the sky. Clouds are OPAQUE where they are thick, so this is a plain mix.
+    over = nt.nodes.new("ShaderNodeMix"); over.location = (x0 + 2360, y0)
+    over.data_type = 'RGBA'
+    nt.links.new(fac.outputs[0], _sock(over, "Factor", 0))
+    nt.links.new(sky_col, _sock(over, "A", 6))
+    nt.links.new(hot.outputs[2], _sock(over, "B", 7))
+    return over.outputs[2]
+
+
+def _horizon_blend(nt, col, x0=520, y0=-560):
+    """Dissolve the backdrop into the scene's own aerial perspective at the horizon.
+
+    Two problems, one fix. Blender's sky renders a dim GROUND below the horizon, so anywhere the
+    map's terrain does not reach - and on a 150 m vista it often does not - the frame ends in a hard
+    dark blue band that reads as the world running out. And even above the horizon, a sky that stays
+    saturated all the way down disagrees with the haze everything else is fading into.
+
+    HAZE_INSCATTER is what this scene's fitted volume converges to at infinite distance, so it is
+    also what the sky must converge to at the horizon: it is the SAME colour a distant ridge becomes.
+    That makes this derived rather than invented - the number comes from the volume fit, not from
+    taste - and it is the one place the backdrop and the depth haze are made to agree.
+
+    `col` must already carry the backdrop's strength (see build_sky_world), because HAZE_INSCATTER is
+    scene-referred and mixing it in ahead of a strength multiply would scale the fitted colour.
+    """
+    geo = nt.nodes.new("ShaderNodeNewGeometry"); geo.location = (x0, y0)
+    rd = nt.nodes.new("ShaderNodeVectorMath"); rd.location = (x0 + 170, y0)
+    rd.operation = 'SCALE'
+    nt.links.new(geo.outputs["Incoming"], rd.inputs[0])
+    _sock(rd, "Scale", 3).default_value = -1.0
+    sep = nt.nodes.new("ShaderNodeSeparateXYZ"); sep.location = (x0 + 340, y0)
+    nt.links.new(rd.outputs["Vector"], sep.inputs[0])
+
+    f = nt.nodes.new("ShaderNodeMapRange"); f.location = (x0 + 510, y0)
+    f.interpolation_type = 'SMOOTHSTEP'
+    nt.links.new(sep.outputs["Z"], f.inputs["Value"])
+    _sock(f, "From Min", 1).default_value = HORIZON_HAZE[0]
+    _sock(f, "From Max", 2).default_value = HORIZON_HAZE[1]
+    _sock(f, "To Min", 3).default_value = 0.0
+    _sock(f, "To Max", 4).default_value = 1.0
+
+    mix = nt.nodes.new("ShaderNodeMix"); mix.location = (x0 + 690, y0)
+    mix.data_type = 'RGBA'
+    nt.links.new(f.outputs["Result"], _sock(mix, "Factor", 0))
+    _sock(mix, "A", 6).default_value = tuple(HAZE_INSCATTER) + (1.0,)   # at and below the horizon
+    nt.links.new(col, _sock(mix, "B", 7))                              # the sky proper, above it
+    return mix.outputs[2]
+
+
+def build_sky_world(nt, sun_dir, backdrop="pack"):
+    """Wire a world node tree's sky. `sun_dir` is BLENDER-space and already normalised.
+
+    Two roles, and the whole point of this function is that they are separable:
+
+      LIGHTING (`backdrop` anything) - the pack cubemap at the fitted SKY_STRENGTH. Every ray that
+      carries light terminates here: diffuse, glossy, transmission, shadow. This is what SUN_ENERGY
+      and SKY_STRENGTH were least-squares fitted against, so it does not change between modes and
+      reflections keep mirroring the sky the rest of the lighting came from.
+
+      BACKDROP (`backdrop="physical"`) - what the LENS sees, split off with Light Path > Is Camera
+      Ray. The pack sky is a 128 px/face reflection capture with a photographic treeline baked into
+      its horizon; it is the right thing to light with and the wrong thing to look at. Because this
+      branch sits behind Is Camera Ray it cannot move the lighting solve BY CONSTRUCTION - verified
+      bit-identical by tools/blender/fit_sky_backdrop.py, not merely argued from the graph shape.
+
+    Shared by example_scene.py and the sky lab so that what is previewed is what renders.
+    """
+    for n in list(nt.nodes):
+        nt.nodes.remove(n)
+    out = nt.nodes.new("ShaderNodeOutputWorld"); out.location = (400, 0)
+
+    bg = nt.nodes.new("ShaderNodeBackground"); bg.location = (150, 100)
+    bg.inputs["Strength"].default_value = SKY_STRENGTH
+    if os.path.isfile(SKY_EQUIRECT):
+        env = nt.nodes.new("ShaderNodeTexEnvironment"); env.location = (-200, 100)
+        env.image = bpy.data.images.load(SKY_EQUIRECT, check_existing=True)
+        nt.links.new(env.outputs["Color"], bg.inputs["Color"])
+    else:
+        bg.inputs["Color"].default_value = (0.36, 0.40, 0.47, 1.0)
+        print("[example] no sky equirect; run tools/blender/make_sky_equirect.py first")
+
+    if backdrop != "physical":
+        nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+        return out
+
+    cam_bg = nt.nodes.new("ShaderNodeBackground"); cam_bg.location = (150, -160)
+    # Left at 1.0 deliberately. The backdrop's strength is folded into its COLOUR further down, so
+    # that the horizon handover can mix in a scene-referred colour after it; see the `gain` node.
+    cam_bg.inputs["Strength"].default_value = 1.0
+    sky = nt.nodes.new("ShaderNodeTexSky"); sky.location = (-200, -160)
+    # 5.x renamed Nishita to MULTIPLE_SCATTERING. Take the first spelling this build accepts and
+    # STOP - trying both in sequence would leave whichever came last, not whichever worked.
+    for val in ('MULTIPLE_SCATTERING', 'NISHITA'):
+        try:
+            sky.sky_type = val
+            break
+        except (TypeError, ValueError):
+            continue
+    # NO SOLAR DISC by default, and the reason here is NOT the one in the docstring. That one - a
+    # disc costs +37% seed-to-seed noise for a uniform -3.4% in the image - is about a disc in the
+    # ENVIRONMENT, where Cycles importance-samples it as a light; behind Is Camera Ray no light path
+    # terminates here at all, so that objection genuinely does not apply and the disc is free.
+    #
+    # It was tried, and it was rejected on a NEW measurement. A 0.526 degree disc carries enormous
+    # radiance, so although it covers well under one pixel of the fit's 128x64 hemisphere it moved
+    # the hemisphere MEAN by 15% (1.3217 -> 1.5216) on its own. Energy-matching then pays for that
+    # single pixel by darkening the entire visible sky 14% (BACKDROP_RATIO 0.1497 -> 0.1287). One
+    # outlier hijacking the statistic that sets everything else is a bad trade for a disc that the
+    # cloud deck covers most of the time anyway. EFT_SUN_DISC=1 draws it; re-fit if you do.
+    _try(sky, "sun_disc", os.environ.get("EFT_SUN_DISC", "0") != "0")
+    # Point it at the PACK'S OWN sun, not Blender's default, or the bright quarter of the sky sits
+    # somewhere the shadows disagree with.
+    _try(sky, "sun_elevation", math.asin(max(-1.0, min(1.0, sun_dir.z))))
+    _try(sky, "sun_rotation", math.atan2(sun_dir.x, -sun_dir.y))
+
+    sky_col = sky.outputs["Color"]
+    if os.environ.get("EFT_CLOUDS", "1") != "0":
+        sky_col = _cloud_nodes(nt, sun_dir, sky_col)
+
+    # THE STRENGTH IS BAKED INTO THE COLOUR, and the Background node is left at 1.0. It has to be:
+    # the horizon blend below mixes toward HAZE_INSCATTER, which is a scene-referred linear value,
+    # and anything mixed in BEFORE a strength multiply would come out scaled by 0.294 instead of
+    # landing on the fitted colour. Doing it in this order also decouples the two, so re-fitting
+    # BACKDROP_RATIO does not silently move the horizon colour.
+    s = SKY_STRENGTH * BACKDROP_RATIO
+    gain = nt.nodes.new("ShaderNodeMix"); gain.location = (-40, -300)
+    gain.data_type = 'RGBA'
+    gain.blend_type = 'MULTIPLY'
+    _sock(gain, "Factor", 0).default_value = 1.0
+    nt.links.new(sky_col, _sock(gain, "A", 6))
+    _sock(gain, "B", 7).default_value = (s, s, s, 1.0)
+    sky_col = gain.outputs[2]
+
+    sky_col = _horizon_blend(nt, sky_col)
+    cam_bg.inputs["Strength"].default_value = 1.0
+    nt.links.new(sky_col, cam_bg.inputs["Color"])
+
+    mix = nt.nodes.new("ShaderNodeMixShader"); mix.location = (280, 0)
+    lp = nt.nodes.new("ShaderNodeLightPath"); lp.location = (-200, 300)
+    # Fac 0 -> lighting sky, Fac 1 -> backdrop. Is Camera Ray is 1 only on the primary ray.
+    nt.links.new(lp.outputs["Is Camera Ray"], mix.inputs["Fac"])
+    nt.links.new(bg.outputs["Background"], mix.inputs[1])
+    nt.links.new(cam_bg.outputs["Background"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    return out
+
+
 def build(mode=None):
     mode = (mode or MODE).lower()
     if mode not in MODES:
@@ -599,23 +1068,17 @@ def build(mode=None):
     w.use_nodes = True; nt = w.node_tree
     for n in list(nt.nodes):
         nt.nodes.remove(n)
-    out = nt.nodes.new("ShaderNodeOutputWorld"); out.location = (400, 0)
-    bg = nt.nodes.new("ShaderNodeBackground"); bg.location = (150, 0)
-    bg.inputs["Strength"].default_value = SKY_STRENGTH
-    if os.path.isfile(SKY_EQUIRECT):
-        env = nt.nodes.new("ShaderNodeTexEnvironment"); env.location = (-200, 0)
-        env.image = bpy.data.images.load(SKY_EQUIRECT, check_existing=True)
-        nt.links.new(env.outputs["Color"], bg.inputs["Color"])
-    else:
-        bg.inputs["Color"].default_value = (0.36, 0.40, 0.47, 1.0)
-        print("[example] no sky equirect; run tools/blender/make_sky_equirect.py first")
-    nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
-
     volj = os.path.join(PACK, "volume.json")
     sd = [0.449, 0.799, -0.400]
     if os.path.isfile(volj):
         sd = json.load(open(volj, encoding="utf-8")).get("sun_dir", sd)
     sun_dir = mathutils.Vector((sd[0], -sd[2], sd[1])).normalized()
+    # EFT_BACKDROP=pack|physical overrides the mode's choice, so the A/B is one env var and not an
+    # edit. This is the only sky knob; there is deliberately no strength override, because the
+    # strength is a measurement and a hand-set one would silently invalidate the exposure match.
+    build_sky_world(nt, sun_dir,
+                    backdrop=(os.environ.get("EFT_BACKDROP") or cfg.get("backdrop", "pack")))
+
     ld = bpy.data.lights.new("eft_sun", 'SUN'); ld.energy = SUN_ENERGY
     ld.angle = math.radians(0.526)              # the sun's real angular diameter
     sun = bpy.data.objects.new("eft_sun", ld); scene.collection.objects.link(sun)

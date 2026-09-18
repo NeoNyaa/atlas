@@ -13,7 +13,7 @@ FORMAT (docs/extraction/lighting-and-sh-bake.md). One JSON array per Unity scene
 ``manifest.sidecars.lightsAll``; ``sidecars.lights`` names only the primary one. Load them ALL and
 de-dup by filename, exactly as the viewer does, or a multi-scene map loses whole buildings.
 
-    name, type ("Point" | "Spot" | "Directional"), position[3] and direction[3] in PACK space,
+    name, type ("Point" | "Spot" | "Directional"), position[3] and direction[3] in RAW UNITY space,
     rotation[4] (xyzw), color[4] LINEAR, intensity, range, spotAngle, innerSpotAngle (both FULL
     angles, degrees), shadowType (Unity LightShadows: 0 None, 1 Hard, 2 Soft), on.
 
@@ -105,7 +105,19 @@ def import_eftlights(pack_dir, parent=None, center=None, radius=None,
             n_off += 1
             continue
 
-        p = [float(v) for v in rec["position"]]
+        # THE ONE SIDECAR THAT IS NOT PRE-CONJUGATED. Every other datum in a pack ships with the
+        # handedness conjugation G3 = diag(-1,1,1) already baked in, so importers never re-apply it.
+        # `lights_*.json` does not: its producer writes Unity world space verbatim
+        # (extraction/unity/eft_extract_lights.py:6-8) and each CONSUMER flips X for itself, as the
+        # viewer does at viewer/src/eftpack.rs:701 and :720 and extract_semantics.py:180-183 does.
+        # This importer did not, so every practical light was mirrored across X against geometry
+        # that had been conjugated. Measured on packs/interchange.eftpack, 1,550 live lights against
+        # the map's own instance AABBs: raw put 73.9% inside an occupied cell (median distance to
+        # geometry 0.49 m), X-flipped puts 97.8% inside (median 0.00 m). Median misplacement 135 m.
+        #
+        # It read as working because a mall is roughly symmetric, so most lights still landed in
+        # SOMETHING and "the interiors are lit" looks like success.
+        p = [-float(rec["position"][0]), float(rec["position"][1]), float(rec["position"][2])]
         if r2 is not None and center is not None:
             d = [p[0] - center[0], p[1] - center[1], p[2] - center[2]]
             if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > r2:
@@ -139,11 +151,14 @@ def import_eftlights(pack_dir, parent=None, center=None, radius=None,
 
         obj = bpy.data.objects.new(ld.name, ld)
         coll.objects.link(obj)
-        obj.location = p                          # PACK space; the parent empty rotates it
+        obj.location = p                          # conjugated above; the parent empty rotates it
         if kind == "Spot":
             # Blender emits down local -Z, so aim that at the extracted forward vector.
             d = rec.get("direction") or [0.0, -1.0, 0.0]
-            fwd = Vector((float(d[0]), float(d[1]), float(d[2])))
+            # Conjugate the beam axis too, or a spot points at the mirror of its own cone. This
+            # hid even better than the position error: a ceiling downlight is X-invariant, so the
+            # measured beam-axis error is a median of 0 degrees and a p90 of 88.7.
+            fwd = Vector((-float(d[0]), float(d[1]), float(d[2])))
             if fwd.length > 1e-6:
                 obj.rotation_euler = fwd.normalized().to_track_quat("-Z", "Y").to_euler()
         if parent is not None:

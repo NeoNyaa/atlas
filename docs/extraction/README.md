@@ -250,6 +250,8 @@ parameter-fitted reconstruction as the no-game-files fallback.
 | Deliberately DEPARTING from the game's look for a photoreal render: the six departures ranked by payoff, what each costs in parity, and how to measure whether it landed | [photorealism](photorealism.md) |
 | Which of the two I need: match the reference frame → game parity; make a still that reads as a photograph → photorealism. They share every number and cross-reference rather than repeat | [game parity](game-parity.md) + [photorealism](photorealism.md) |
 | Skeleton and skinning, animation clip decode, the animator graph, equipment binding, the `.eftchar` container | [characters and animation](characters-and-animation.md) |
+| Who a bot IS and what he is WEARING: the appearance roll, the kit roll from the game own weighted tables, the skinned/rigid split, garment variants, and which two values here are AUTHORED rather than derived | [outfits and kits](outfits-and-kits.md) |
+| Assembling a weapon from presets, slots and filters, the `.eftweap` container, the aim block, and why the weapon undoes the `q4` bone-axis permutation when rigid equipment must NOT | [weapons and attachments](weapons-and-attachments.md) |
 | Sky cubemap faces and derived colours, particle systems and flipbook atlases, the Water4 parameter set | [sky, particles and water](sky-particles-and-water.md) |
 | Light extraction, controller-driven lamps, what EFT does and does not ship, the SH irradiance volume format and bake math | [lighting and the SH bake](lighting-and-sh-bake.md) |
 | Build stages, caching and forced invalidation, the `.eftpack` directory layout, `manifest.json` schema, every binary stride and offset, self-contained packs | [build pipeline and pack format](build-pipeline-and-pack-format.md) |

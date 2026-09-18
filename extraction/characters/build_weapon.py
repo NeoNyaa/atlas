@@ -579,7 +579,22 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
             N = N[:n] if N.shape[0] >= n else np.tile([0.0, 1.0, 0.0], (n, 1))
         else:
             N = np.tile([0.0, 1.0, 0.0], (n, 1))
-        N = (G3 @ (M[:3, :3] @ N.T)).T
+        # A NORMAL DOES NOT TRANSFORM LIKE A POSITION. It transforms by the inverse transpose, and
+        # `M` here is a full mod-chain composition that can carry non-uniform scale, so pushing a
+        # normal through `M[:3,:3]` skews it off the surface. The conjugation is separate and IS a
+        # plain multiply: G3 is diagonal, so (G3^-1)^T == G3.
+        #
+        # Then renormalise. The inverse transpose does not preserve length under any scale at all,
+        # and an un-normalised normal reads as a shading error rather than a geometry one, which is
+        # why this survived: the gun looks lit slightly wrong, not broken.
+        m3 = M[:3, :3]
+        try:
+            n_xf = np.linalg.inv(m3).T
+        except np.linalg.LinAlgError:
+            n_xf = m3                                  # singular: nothing better to do than before
+        N = (G3 @ (n_xf @ N.T)).T
+        ln = np.linalg.norm(N, axis=1, keepdims=True)
+        N = np.divide(N, np.where(ln < 1e-12, 1.0, ln))
         uv = getattr(h, "m_UV0", None) or getattr(h, "m_UV1", None)
         if uv:
             UV = np.asarray(uv, np.float64)

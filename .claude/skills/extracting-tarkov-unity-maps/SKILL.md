@@ -5,7 +5,8 @@ description: >
   (scene.json + OBJ + PNG) to .eftpack (manifest.json, meshes.bin, instances.bin, materials.json,
   sidecars) to renderer. Covers the instance placement formula and the ban on TRS decomposition,
   the handedness conjugation, the OBJ vertex X-negation, the texture V-flip, terrain and MicroSplat,
-  StaticDeferredDecal projectors, characters and skinned meshes, sky, particles, water, colliders,
+  StaticDeferredDecal projectors, characters and skinned meshes, outfits, equipment kits, weapons
+  and their attachments, sky, particles, water, colliders,
   the light and SH irradiance bake, IL2CPP MonoBehaviour raw-payload reading, and the failure
   signature of every broken invariant. ALSO covers rebuilding a pack in another renderer: the
   Blender importers in tools/blender/, which channel means what per material role, nav routing, the
@@ -15,16 +16,20 @@ description: >
   BEFORE editing any placement, coordinate, UV, or handedness convention.
   Keywords: Tarkov, EFT, Unity, UnityPy, scene.json, eftpack, decal projector, handedness,
   conjugation, shear, V-flip, MicroSplat, SH irradiance volume, IL2CPP, Blender, Cycles, glassTRS,
+  loadout, kit, helmet, backpack, chest rig, bindpose, attachment socket, weapon mods,
   SoftCutout, colour grade, OCIO, AgX.
 ---
 
 # Extracting Tarkov Unity maps
 
-**Read `docs/extraction/README.md` now.** It is the navigation layer and it routes to fourteen
+**Read `docs/extraction/README.md` now.** It is the navigation layer and it routes to sixteen
 reference documents. Ten describe the pipeline itself: geometry and placement, textures and
 materials, terrain and the colour grade, decals, game data, colliders and the semantic name layer,
 characters and animation, sky and particles and water, lighting and the irradiance bake, and the
-build stages and pack format. Four describe rebuilding a pack somewhere else: `blender-import.md`
+build stages and pack format. Two more cover WHO a character is and WHAT he carries:
+`outfits-and-kits.md` (the appearance and kit rolls, the skinned/rigid split, garment variants)
+and `weapons-and-attachments.md` (preset/slot/filter assembly, the `.eftweap` container, the aim
+block). Four describe rebuilding a pack somewhere else: `blender-import.md`
 (the importers, the ported shader families, the two build modes), `game-parity.md` (making an
 external renderer produce the GAME'S image, and how to prove it), `photorealism.md` (what to give
 up for a photograph, ranked by payoff) and `photoreal-lowergamefidelity.md` (the tier that edits
@@ -51,5 +56,22 @@ The rules most often got wrong, so that a wrong turn is caught before the full r
 - The pack ships no sun and no directional light at all. Sun and sky strength for an offline render
   are SOLVED against a viewer frame, never guessed; a path tracer is linear in each light's power,
   so two basis renders span the space.
+- The shipped sky is a 128 px/face reflection CAPTURE with a treeline baked into its horizon: the
+  right thing to light with, the wrong thing to look at. Photoreal mode splits those two roles with
+  `Light Path > Is Camera Ray` so the fitted sun/sky pair is untouched (verified bit-identical, not
+  argued). Anything that changes the backdrop's appearance must re-run `fit_sky_backdrop.py`, and
+  that fit is over the solid-angle-weighted HEMISPHERE: measured on one frame the same comparison
+  gives 18.9x level and 2.2x the other way pitched up, i.e. it fits the framing, not the sky.
 - A spatial filter tests an instance's world AABB, never its centre or its translation. Pre-baked
   geometry ships an identity affine, and a 700 m terrain tile is larger than any radius.
+- **Attach a thing in the frame it was AUTHORED in, and there is more than one.** The weapon is
+  authored in the ENGINE bone frame, so it undoes the importer's `q4` bone-axis permutation. Rigid
+  equipment is authored UNITY Y-UP (a prefab root at identity over a mesh node carrying one -90 deg
+  X fixup), so it does not. This rig is +X-down-the-bone, so those two frames differ by exactly 90
+  degrees: use the weapon's rule on a helmet and the crown points forward out of the face. Nothing
+  errors, because the geometry is present, watertight and correctly textured, and only a render
+  shows it.
+- A whole class of bug here is SILENT: geometry composed in the wrong frame is never missing, only
+  rotated or offset. When touching any frame, write down next to the code which frame each side is
+  in, and verify by MEASURING a known axis (the head bone's up against the skull's) rather than by
+  reading the render.

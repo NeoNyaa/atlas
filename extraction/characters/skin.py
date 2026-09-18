@@ -19,6 +19,7 @@ so assembling a character is "spawn the rig once, attach N meshes".
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -343,6 +344,33 @@ def _pack_vertices(
 # ---------------------------------------------------------------------------
 # main entry
 # ---------------------------------------------------------------------------
+def _resolved_material(idx, result, material_base, first_textured):
+    """The material a submesh should actually wear.
+
+    A submesh whose material resolved to NO textures at all is a binding failure, not an artistic
+    choice, and there are two ways to get one. A mesh with no renderer in the loaded env falls back
+    to whatever material was indexed first, which after dependency resolution can be a SHADOW caster
+    proxy. And a mesh matched to a DEPENDENCY renderer can be pointed at Unity's `Default-Material`,
+    whose nine texture slots all resolve to nothing, while the container's own renderer names the
+    real five-slot material - measured on `item_equipment_rig_6b5_flora`.
+
+    Both produce the same visible result: a worn item rendered flat and untextured. So both are
+    treated the same way, and the part's first REAL material is used instead.
+
+    The cost is that a genuinely texture-less material gets replaced. That is acceptable because
+    such a material renders as a flat blank anyway, and it is loud rather than silent: an item that
+    should be blank now shows the part's own albedo, which is obvious in a render, whereas the
+    failure it replaces looked like a missing texture and was not.
+    """
+    if idx is None:
+        return first_textured if first_textured is not None else material_base
+    local = idx - material_base
+    if 0 <= local < len(result.materials) and not result.materials[local].textures:
+        if first_textured is not None:
+            return first_textured
+    return idx
+
+
 def load_part(
     bundle_path: str,
     part_name: str,
@@ -350,6 +378,8 @@ def load_part(
     material_base: int,
     strict: bool = True,
     lods: Optional[Sequence[int]] = None,
+    skip_unskinned: bool = False,
+    resolve_deps: bool = True,
 ) -> PartResult:
     """Read one part bundle. `material_base` is the pack-wide index the first emitted material takes.
 
@@ -358,28 +388,103 @@ def load_part(
     import UnityPy
     from UnityPy.helpers.MeshHelper import MeshHandler
 
-    env = UnityPy.load(bundle_path)
+    # RESOLVE CAB DEPENDENCIES, not just the one bundle.
+    #
+    # A body prefab is self-contained, so a bare `UnityPy.load` was enough and nothing showed. An
+    # EQUIPMENT prefab often is not: `item_equipment_armor_6b23_mflora.bundle` carries no `Mesh` at
+    # all (the geometry is in a neighbour) and the ULACH helmet and the 6B34 glasses carry their
+    # materials but not the `Texture2D` those materials point at. Both failures are silent in
+    # different ways - the first raised "no Mesh objects" and lost the whole item, the second
+    # produced a material with an empty texture set that renders PURE WHITE, which is what put a
+    # blank white face on a rendered operative.
+    #
+    # GEOMETRY still comes from the CONTAINER ONLY. Dependency bundles are shared and carry
+    # unrelated assets, so baking everything in `env` would drag a neighbour's meshes into this
+    # part (the weapon builder learned the same lesson). Materials and textures are looked up
+    # across the whole env, because that is exactly the cross-bundle reference being repaired, and
+    # a dependency entry is only consulted for a path_id the container did not already define -
+    # path_ids are per-file, so preferring the container's own is what keeps a collision from
+    # silently binding a stranger's texture.
+    own_ids = None
+    if resolve_deps:
+        import unity_deps
+        env = UnityPy.Environment()
+        try:
+            own, _n = unity_deps.resolve_into(env, bundle_path, unity_deps.load(verbose=False))
+            own_ids = {id(o) for o in own}
+        except Exception as exc:
+            print(f"  [deps] {os.path.basename(bundle_path)}: dependency resolve failed ({exc}); "
+                  f"falling back to the single bundle")
+            env = UnityPy.load(bundle_path)
+            own_ids = None
+    else:
+        env = UnityPy.load(bundle_path)
     result = PartResult()
 
     # ---- pass 1: index the bundle -------------------------------------------------
     meshes: List[Tuple[object, dict]] = []  # (object_reader, typetree)
     smrs: List[dict] = []
     mats_by_pathid: Dict[int, dict] = {}
+    mat_candidates: Dict[int, list] = {}
     texs_by_pathid: Dict[int, object] = {}
     skins: List[dict] = []
 
-    for obj in env.objects:
+    def _is_own(o):
+        return own_ids is None or id(o) in own_ids
+
+    # WHICH MESHES ARE OURS is not "the ones in this file". `item_equipment_armor_6b23_mflora`
+    # contains no `Mesh` at all: both its SkinnedMeshRenderers point at `m_FileID: 1`, an EXTERNAL
+    # file, and the geometry lives in a dependency. So "meshes from the container only" loses the
+    # item entirely, while "every mesh in the env" drags in the neighbours that share that bundle.
+    # The precise rule is the meshes THIS PREFAB'S OWN RENDERERS REFERENCE, by path_id.
+    wanted_mesh_ids = set()
+    for o in env.objects:
+        if not _is_own(o) or o.type.name not in ("SkinnedMeshRenderer", "MeshFilter"):
+            continue
+        try:
+            pid = int((o.read_typetree().get("m_Mesh") or {}).get("m_PathID", 0))
+        except Exception:
+            continue
+        if pid:
+            wanted_mesh_ids.add(pid)
+
+    for obj in sorted(env.objects, key=lambda o: 0 if _is_own(o) else 1):
         tname = obj.type.name
+        mine = _is_own(obj)
         if tname == "Mesh":
-            meshes.append((obj, obj.read_typetree()))
+            if mine or obj.path_id in wanted_mesh_ids:
+                meshes.append((obj, obj.read_typetree()))
         elif tname == "SkinnedMeshRenderer":
-            smrs.append(obj.read_typetree())
+            # INDEX EVERY RENDERER, not just the container's. Geometry is still restricted to the
+            # meshes the container's own renderers reference (`wanted_mesh_ids`), but the RENDERER
+            # that owns such a mesh can itself live in the dependency - and it is the only thing
+            # that says which material the mesh wears. Missing it made `smr_by_mesh` come up empty,
+            # `smr_mats` empty, and the material fall back to `material_base`, which after
+            # dependency resolution is whatever material happened to be indexed first: for
+            # `item_equipment_backpack_takedown_sling` that was a SHADOW_2SIDED caster proxy, so
+            # the USEC's backpack rendered untextured while its real 5-slot material sat unused.
+            smrs.append((bool(mine), obj.read_typetree()))
         elif tname == "Material":
-            mats_by_pathid[obj.path_id] = obj.read_typetree()
+            # PATH IDS ARE PER FILE, so one dict keyed by path_id alone is a collision waiting to
+            # happen once dependencies are loaded - and it happened: `item_equipment_backpack_
+            # takedown_sling`'s renderers reference a material that lives in a dependency and has 5
+            # texture slots, while a SHADOW_2SIDED caster proxy in another loaded file carries the
+            # SAME path_id. The shadow won and the USEC's backpack rendered untextured.
+            #
+            # Keep every candidate. The tiebreak below prefers the container's own, then the one
+            # that actually has textures: a shadow-caster proxy has none by construction, so it can
+            # never displace a real material.
+            tt_m = obj.read_typetree()
+            n_tex = len((tt_m.get("m_SavedProperties") or {}).get("m_TexEnvs") or [])
+            mat_candidates.setdefault(obj.path_id, []).append((bool(mine), n_tex, tt_m))
+            if mine or obj.path_id not in mats_by_pathid:
+                mats_by_pathid[obj.path_id] = tt_m
         elif tname == "Texture2D":
-            texs_by_pathid[obj.path_id] = obj
+            if mine or obj.path_id not in texs_by_pathid:
+                texs_by_pathid[obj.path_id] = obj
         elif tname == "MonoBehaviour" and _script_name(obj) == "Skin":
-            skins.append(obj.read_typetree())
+            if mine:
+                skins.append(obj.read_typetree())
 
     if not meshes:
         raise RuntimeError(f"{bundle_path}: no Mesh objects")
@@ -387,6 +492,20 @@ def load_part(
     # ---- materials + textures ----------------------------------------------------
     #: Material path_id -> pack material index. SMRs reference materials by PPtr.
     mat_index: Dict[int, int] = {}
+    # Resolve each collision: container's own first, then most texture slots.
+    for pid, cands in mat_candidates.items():
+        if len(cands) > 1:
+            best = max(cands, key=lambda c: (c[0], c[1]))
+            if best[2] is not mats_by_pathid.get(pid):
+                mats_by_pathid[pid] = best[2]
+                print("  [mat] path_id %d had %d candidates; kept %r (%d texture slots)"
+                      % (pid, len(cands), str(best[2].get("m_Name")), best[1]))
+    # The fallback for a mesh whose renderer is not in the env must be a REAL material. Before
+    # dependency resolution the part's first material was its own and textured, so `material_base`
+    # was a safe default; now the first indexed material can be a SHADOW caster proxy pulled in from
+    # a neighbour, and three of the takedown sling's four cuts - genuine variants, 5,194 verts each,
+    # not proxies - landed on it and rendered untextured.
+    first_textured = None
     for pid, mt in mats_by_pathid.items():
         mat = Material(name=str(mt.get("m_Name", f"material_{pid}")))
         saved = mt.get("m_SavedProperties", {}) or {}
@@ -417,15 +536,31 @@ def load_part(
                 float(c.get("b", 1.0)),
                 float(c.get("a", 1.0)),
             ]
+        if first_textured is None and mat.textures:
+            first_textured = material_base + len(result.materials)
         mat_index[pid] = material_base + len(result.materials)
         result.materials.append(mat)
 
     # ---- SMR lookup: mesh path_id -> its renderer (for the material list) --------
+    # SEVERAL renderers can name the same mesh - a worn one and a SHADOW caster proxy - and the
+    # last write used to win, which handed three of the takedown sling's four cuts a texture-less
+    # SHADOW material. Choose deliberately: the container's own renderer first, then the one whose
+    # material actually has texture slots. A caster proxy has none by construction, so it can only
+    # ever be the fallback.
+    def _smr_rank(entry):
+        mine, smr = entry
+        pids = [int((m or {}).get("m_PathID", 0)) for m in (smr.get("m_Materials") or [])]
+        textured = any(
+            len((mats_by_pathid.get(pid, {}).get("m_SavedProperties") or {}).get("m_TexEnvs") or [])
+            for pid in pids
+        )
+        return (1 if mine else 0, 1 if textured else 0)
+
     smr_by_mesh: Dict[int, dict] = {}
-    for smr in smrs:
-        mpid = int((smr.get("m_Mesh") or {}).get("m_PathID", 0))
+    for entry in sorted(smrs, key=_smr_rank):          # best last, so it wins the overwrite
+        mpid = int((entry[1].get("m_Mesh") or {}).get("m_PathID", 0))
         if mpid:
-            smr_by_mesh[mpid] = smr
+            smr_by_mesh[mpid] = entry[1]
 
     # `Skin` bone paths are per renderer; in practice a part has one binding set shared by its
     # LOD meshes, so take the first non-empty and validate per mesh against the hashes.
@@ -466,6 +601,15 @@ def load_part(
         )
 
         if not handler.m_BoneIndices or not handler.m_BoneWeights:
+            if skip_unskinned:
+                # An EQUIPMENT prefab is not one renderer. `item_equipment_backpack_wartech` ships
+                # the worn `SkinnedMeshRenderer` AND `BP_WarTech_Drop_SHADOW_lod0`, the rigid
+                # dropped-on-the-ground proxy, in the same bundle; a chest rig ships its pouches the
+                # same way. Those carry no weights and are not what the character wears, so on the
+                # equipment path they are skipped rather than failing the whole part. A BODY part
+                # keeps the hard error: a body mesh with no weights is a real corruption.
+                print(f"  [skip] {name}: no skin weights (rigid proxy in a skinned prefab)")
+                continue
             raise RuntimeError(
                 f"{name}: no skin weights in the vertex data -- this is not a skinned mesh"
             )
@@ -542,7 +686,9 @@ def load_part(
             mat_pid = smr_mats[si] if si < len(smr_mats) else (smr_mats[0] if smr_mats else 0)
             submeshes.append(
                 SubMesh(
-                    material=mat_index.get(mat_pid, material_base),
+                    material=_resolved_material(
+                        mat_index.get(mat_pid), result, material_base, first_textured
+                    ),
                     index_start=cursor,
                     index_count=int(seg.size),
                 )
@@ -583,17 +729,54 @@ def load_attachment(
     import UnityPy
     from UnityPy.helpers.MeshHelper import MeshHandler
 
-    env = UnityPy.load(bundle_path)
+    # Same cross-bundle repair as `load_part`, and needed for the same reason: the ULACH helmet
+    # ships its Material but not the Texture2D it points at, so a single-bundle load produced an
+    # empty texture set and rendered a pure white helmet over the operative's face. Geometry is
+    # still taken from the CONTAINER only; materials and textures may come from a dependency, and
+    # a dependency entry is consulted only for a path_id the container did not already define.
+    own_ids = None
+    try:
+        import unity_deps
+        env = UnityPy.Environment()
+        own, _n = unity_deps.resolve_into(env, bundle_path, unity_deps.load(verbose=False))
+        own_ids = {id(o) for o in own}
+    except Exception as exc:
+        print(f"  [deps] {os.path.basename(bundle_path)}: dependency resolve failed ({exc}); "
+              f"falling back to the single bundle")
+        env = UnityPy.load(bundle_path)
+        own_ids = None
+
     meshes: List[Tuple[object, dict]] = []
     renderers: List[dict] = []
     filters: Dict[int, dict] = {}
     mats_by_pathid: Dict[int, dict] = {}
+    mat_candidates: Dict[int, list] = {}
     texs_by_pathid: Dict[int, object] = {}
     tfs: Dict[int, dict] = {}
     gos: Dict[int, dict] = {}
 
-    for obj in env.objects:
+    def _is_own(o):
+        return own_ids is None or id(o) in own_ids
+
+    wanted_mesh_ids = set()
+    for o in env.objects:
+        if not _is_own(o) or o.type.name not in ("MeshFilter", "SkinnedMeshRenderer"):
+            continue
+        try:
+            pid = int((o.read_typetree().get("m_Mesh") or {}).get("m_PathID", 0))
+        except Exception:
+            continue
+        if pid:
+            wanted_mesh_ids.add(pid)
+
+    for obj in sorted(env.objects, key=lambda o: 0 if _is_own(o) else 1):
         t = obj.type.name
+        mine = _is_own(obj)
+        if t == "Mesh":
+            if not (mine or obj.path_id in wanted_mesh_ids):
+                continue
+        elif t in ("MeshRenderer", "MeshFilter", "Transform", "GameObject") and not mine:
+            continue
         if t == "Mesh":
             meshes.append((obj, obj.read_typetree()))
         elif t == "MeshRenderer":
@@ -601,9 +784,23 @@ def load_attachment(
         elif t == "MeshFilter":
             filters[obj.path_id] = obj.read_typetree()
         elif t == "Material":
-            mats_by_pathid[obj.path_id] = obj.read_typetree()
+            # PATH IDS ARE PER FILE, so one dict keyed by path_id alone is a collision waiting to
+            # happen once dependencies are loaded - and it happened: `item_equipment_backpack_
+            # takedown_sling`'s renderers reference a material that lives in a dependency and has 5
+            # texture slots, while a SHADOW_2SIDED caster proxy in another loaded file carries the
+            # SAME path_id. The shadow won and the USEC's backpack rendered untextured.
+            #
+            # Keep every candidate. The tiebreak below prefers the container's own, then the one
+            # that actually has textures: a shadow-caster proxy has none by construction, so it can
+            # never displace a real material.
+            tt_m = obj.read_typetree()
+            n_tex = len((tt_m.get("m_SavedProperties") or {}).get("m_TexEnvs") or [])
+            mat_candidates.setdefault(obj.path_id, []).append((bool(mine), n_tex, tt_m))
+            if mine or obj.path_id not in mats_by_pathid:
+                mats_by_pathid[obj.path_id] = tt_m
         elif t == "Texture2D":
-            texs_by_pathid[obj.path_id] = obj
+            if mine or obj.path_id not in texs_by_pathid:
+                texs_by_pathid[obj.path_id] = obj
         elif t == "Transform":
             tfs[obj.path_id] = obj.read_typetree()
         elif t == "GameObject":
@@ -612,6 +809,14 @@ def load_attachment(
     materials: List[Material] = []
     images: Dict[str, object] = {}
     mat_index: Dict[int, int] = {}
+    # Resolve each collision: container's own first, then most texture slots.
+    for pid, cands in mat_candidates.items():
+        if len(cands) > 1:
+            best = max(cands, key=lambda c: (c[0], c[1]))
+            if best[2] is not mats_by_pathid.get(pid):
+                mats_by_pathid[pid] = best[2]
+                print("  [mat] path_id %d had %d candidates; kept %r (%d texture slots)"
+                      % (pid, len(cands), str(best[2].get("m_Name")), best[1]))
     for pid, mt in mats_by_pathid.items():
         mat = Material(name=str(mt.get("m_Name", f"material_{pid}")))
         saved = mt.get("m_SavedProperties", {}) or {}

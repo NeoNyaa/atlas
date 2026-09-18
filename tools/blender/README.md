@@ -64,7 +64,12 @@ in that file.
    by frame and smoothing afterwards.
 9. **World and sun.** `make_sky_equirect.py` converts the pack's cubemap once; the sun direction
    comes from `volume.json`, but its *strength* and the sky's do not exist in the pack and must be
-   fitted (below).
+   fitted (below). That cubemap is a 128 px/face reflection capture with a photographic treeline
+   baked into its horizon, so photoreal mode uses it for LIGHTING only and puts a physical sky plus
+   a procedural cloud layer on camera rays, exposure-matched by `fit_sky_backdrop.py` and handed over
+   to the scene's own `HAZE_INSCATTER` at the horizon. Game mode shows the capture, because that is
+   what the game shows. `EFT_BACKDROP=pack|physical` and `EFT_CLOUDS=0` force either.
+   `sky_lab.py` renders the same world graph without the map, in seconds, for iterating on it.
 10. **Render flat, grade after.** Cycles to linear EXR, then `eft_grade.py`. The render stays
     scene-referred, so one set of frames can answer both questions.
 
@@ -80,11 +85,14 @@ in that file.
 | `import_eftlights.py` | in Blender | the practical lights from every `lights_*.json` sidecar, with Unity intensity converted to watts |
 | `terrain_splat.py` | in Blender | rebuilds terrain materials as the real MicroSplat blend |
 | `cine_camera.py` | in Blender | solves a follow camera over the whole shot (Viterbi over candidate positions), plus `cinematic_render_settings` |
+| `weapon_hold.py` | anywhere | keeps the hands on the weapon when clips are stitched. numpy only, no `bpy`, so the solve is testable outside Blender. Two corrections: it carries the weapon socket across the 33 clips that key no `Weapon_root` at all, and it solves both arms back onto the authored grip after a cross-fade. See `docs/extraction/characters-and-animation.md` §14 |
 | `nav_route.py` | anywhere | routes between points on the pack's baked nav grid. numpy only, no `bpy`. A port of the viewer's router, not an approximation |
 | `eft_grade.py` | anywhere | the game's display chain (exposure, shaper, 64-cube LUT, vignette) applied to linear EXR, plus the AgX and filmic looks and the photoreal metering, optical vignette and grain stages. `--selfcheck-agx` diffs its AgX against Blender's own OCIO |
 | `bake_cavity.py` | outside Blender | Poisson-integrates every normal map the pack ships into a multi-scale cavity map for `import_eftpack(cavity_dir=)`. Photoreal only: the game shader has no AO term at any scale |
 | `make_ocio_config.py` | outside Blender | writes an OCIO config that installs the game grade as a selectable Blender View, so look-dev happens under the game's look instead of AgX |
 | `make_sky_equirect.py` | outside Blender | the shipped cubemap faces to an equirectangular world texture |
+| `fit_sky_backdrop.py` | Blender, background | measures the photoreal backdrop against the pack sky and solves `BACKDROP_RATIO`; re-run after ANY change to the backdrop's appearance |
+| `sky_lab.py` | Blender, background | the world graph alone behind a stand-in horizon, for judging the sky without a 20-minute pack load |
 
 `../../docs/extraction/blender-import.md` carries the same table with the node graphs, the derived
 probes and the traps behind each entry.

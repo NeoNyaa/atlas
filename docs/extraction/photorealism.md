@@ -120,6 +120,12 @@ Two viewer constants also stop meaning anything: the analytic sky reflection gai
 wants real volumetric aerial perspective, not a per-pixel exponential haze fitted to a horizon
 colour.
 
+> **What was actually implemented is narrower than this section proposes, and the difference is the
+> whole point.** "Replace the environment image" is what costs the fit. Photoreal mode instead
+> replaces only what the LENS sees and leaves every ray that carries light on the shipped cubemap,
+> so none of the four constants above is invalidated - measured, not argued. See the split note at
+> the end of §14.
+
 ---
 
 ## 2. The grade clips and desaturates
@@ -392,6 +398,123 @@ texels have a channel at 255, only 0.56% are pure white, and the clipped plateau
 587 near-mirror materials rather than on overall light; and the null result was measured on a
 courtyard frame where only 0.611% of pixels exceed linear 1.0, which is the weakest possible test
 for a sky-reflection change.
+
+**...but half of item 1 was worth doing, and the measurement above is what says which half.** Every
+number in the paragraph above is about the sky **lighting the scene**. What a camera ray terminates
+on is a separate question, and Cycles will answer the two differently through `Light Path > Is
+Camera Ray` into a Mix Shader. So photoreal mode now **splits** them: lighting, shadows, glossy and
+transmission rays all still terminate on the pack cubemap at exactly the fitted `SKY_STRENGTH` -
+`SUN_ENERGY`/`SKY_STRENGTH` are the pair that was solved against a viewer frame and nothing here
+touches them - while the pixels the lens actually sees get a physical sky pointed at the pack's own
+`sun_dir`. Reflections deliberately stay on the cubemap: a puddle should mirror the sky the rest of
+the lighting came from.
+
+This is worth doing because the pack sky is a **reflection probe**, 128 px per face, about **0.70
+degrees per texel**. `make_sky_equirect.py` resampling it to 2048x1024 makes it smooth, and no
+resampling recovers cloud edges that were never in the source. As an environment that is completely
+adequate. As the thing filling the top third of a photograph it is a flat wash.
+
+`BACKDROP_RATIO = 0.052866` is a measurement on the same footing as `SUN_ENERGY`, not a taste knob.
+Both skies were rendered alone at 128x64, Raw view transform, no geometry and no sun lamp: pack
+**0.202913**, physical **3.838239** at strength 1.0, so the physical sky is **18.9x** brighter and
+that factor is what undoes it. Reproduce with `tools/blender/fit_sky_backdrop.py`, which also
+verifies the built graph both ways: the backdrop reads **+0.11%** against the sky it replaces, and a
+diffuse probe lit through the split is **bit-identical** (+0.000%) to one lit by the cubemap alone.
+That second number is the important one - it is what makes "the lighting solve is untouched" a
+measured claim rather than an argument from how the node graph looks.
+
+`EFT_BACKDROP=pack|physical` overrides the mode's choice for an A/B, and `EFT_CLOUDS=0` removes the
+cloud layer. There is deliberately no strength override, because a hand-set strength would silently
+break the exposure match.
+
+**Measure the two skies over the hemisphere, not over a frame.** The first version of this fit
+compared one rectilinear frame and got 18.9x - the camera was level, which is exactly where the pack
+capture's baked treeline sits, so its mean was dragged down. Pitched 18 degrees up the same
+comparison inverted to 2.2x the other way, because the pack's bright upper sky is up there. A single
+view direction fits the FRAMING, not the sky. `fit_sky_backdrop.py` now uses an equirectangular
+camera over the upper hemisphere with rows cosine-weighted for solid angle, which is view-independent.
+
+**Two clouds, and one of them is a departure worth naming.** The layer is procedural and every
+constant in it is invented, because the pack ships no cloud data of any kind and there is nothing to
+derive from. What keeps it honest is that it lives entirely behind `Is Camera Ray`: it cannot reach
+the lighting, it cannot reach parity mode, and it is one env var from being gone. It is a ray-plane
+intersection against a layer at `CLOUD_ALTITUDE`, not noise on a dome, because the cue that sells a
+sky is that cloud cells shrink and crowd together toward the horizon; a dome keeps them the same
+angular size and reads as a painted ceiling. Brightness runs INVERSE to thickness - thin cloud
+transmits and is bright, a thick base seen from below is dark - which is the opposite of the first
+implementation and the correction that made it read as cloud at all.
+
+**The horizon hands over to the scene's own haze, and that part is derived.** Blender's sky paints a
+dim ground below the horizon, which shows as a hard dark band anywhere the map's terrain does not
+reach. The backdrop instead converges to `HAZE_INSCATTER`, the colour this scene's fitted volume
+converges to at infinite distance - the same colour a distant ridge becomes. The blend must complete
+exactly AT the horizon: letting even 19% of the sky texture through at `z = 0` draws its own
+sky/ground discontinuity as a line across the frame.
+
+**Two scale traps this created, both now handled in code.** The backdrop's strength is baked into the
+colour and the Background node left at 1.0, because `HAZE_INSCATTER` is scene-referred and mixing it
+in ahead of a strength multiply would land it at 0.294 of the fitted colour. And because that fixed
+colour does not scale with `BACKDROP_RATIO`, the backdrop is AFFINE in the ratio rather than linear,
+so the fit samples two ratios and solves `mean = a + b*ratio` instead of taking a ratio of means -
+which converges in one step (0.0025% residual) where the naive correction overshot by 20%.
+
+**What the distribution says, and why no arbitrary look offset was added.** Over the hemisphere:
+
+| | p50 | p99 | p99.9 | above linear 1.0 |
+|---|---|---|---|---|
+| pack capture | 1.512 | 2.343 | 2.351 | **82.7%** |
+| physical + clouds | 0.823 | 2.589 | 3.096 | **37.2%** |
+
+The pack sky is the blown one: 83% of it above linear 1.0 with a p99/p50 of just 1.55, i.e. a bright
+flat wash. The energy-matched physical sky has a LOWER median and more than three times the range.
+Bright cloud reading near white in the top percentile is what bright cloud does in a photograph, so
+the measurement says the energy match is already the better exposure and a hand-tuned offset would
+be making it worse on purpose.
+
+**The cloud palette must be RELATIVE to the sky, and getting this wrong made the whole deck a
+silhouette.** The first implementation mixed absolute constants into raw `ShaderNodeTexSky`
+radiance. Measured over the upper hemisphere that raw sky runs **min 2.323, median 3.596, max
+18.9**, while the palette's luminances were shadow **0.246**, lit **0.968**, silver **1.300**. Every
+tone was darker than the *darkest sky pixel that exists* - 0.11x, 0.42x and 0.56x of the minimum -
+so cloud could only ever read as a stain, its internal modelling sat in AgX's toe, and the "silver
+lining" was the dimmest part of the deck. Every bright region in those frames was sky showing
+through, not lit cloud, which is why tuning the tone model kept not behaving as predicted.
+
+The evidence was already sitting in the fit and was misread: adding the cloud layer moved
+`BACKDROP_RATIO` **up** 2.37x. Up means the backdrop needed *more* gain, which means the clouds made
+it **darker**. That was recorded in a comment claiming the opposite.
+
+Each tone is now the local sky's **luminance** times a gain times an authored chromaticity:
+`CLOUD_GAIN_SHADOW 0.30`, `_LIT 1.05`, `_SILVER 1.45`. Luminance and never the sky's colour -
+multiplying by the colour makes every tone inherit the sky's blue, collapses deck and sky into one
+hue family, and erases the warm-key/cool-base separation that is most of what reads as cloud (a base
+is lit by the SKY and is cool; a sun-facing face is lit by the SUN and is warm). As ratios the
+numbers also no longer depend on `SKY_STRENGTH`, `BACKDROP_RATIO` or the sky model's own scale, so
+none of those can silently invert it again. The rebase raised the hemisphere mean 28.3% and moved
+pixels above linear 1.0 from 37.2% to 65.1%, i.e. toward the capture's 82.7% rather than away.
+
+One implementation trap: the luminance dot product must read the *raw* sky argument. Reading the
+cloud composite instead wires the mix back into its own input, which `links.new` builds happily and
+Cycles then reports as a dependency cycle.
+
+**The solar disc was tried again on the new footing, and rejected on a new measurement.** The old
+objection (+37% seed-to-seed noise) is about a disc in the ENVIRONMENT, where Cycles
+importance-samples it as a light; behind `Is Camera Ray` nothing terminates on it, so that objection
+genuinely does not apply and the disc is free to draw. It still loses. A 0.526 degree disc covers
+well under one pixel of the fit's 128x64 hemisphere and yet moved the hemisphere mean **15%**
+(1.3217 to 1.5216) by itself, because its radiance is enormous. Energy-matching then pays for that
+one pixel by darkening the **entire visible sky by 14%** (`BACKDROP_RATIO` 0.1497 to 0.1287). Letting
+a single outlier set the exposure of everything else is a bad trade, particularly for a disc the
+cloud deck occludes most of the time. `EFT_SUN_DISC=1` draws it; re-run the fit if you do.
+
+This is worth remembering as a property of mean-matching in general, not a fact about suns: any
+statistic an outlier can hijack will be hijacked, and the fix is either to exclude the outlier or to
+match on something robust.
+
+**What this still does not fix: the horizon.** The game's visible skyline is `SkyboxMountains01..08`
+GEOMETRY, which this repository has never extracted. A physical sky gives a clean gradient and a sun
+glow in the right place; it does not give back the mountains, and nothing short of extracting them
+will.
 
 **The "12x dynamic range" claim was mostly brightness.** The photoreal test frame's p99.9 of 16.50
 against the game path's 1.36 is 12.1x, but its median is also 7.4x higher. Normalised by each
